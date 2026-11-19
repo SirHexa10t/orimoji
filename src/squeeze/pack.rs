@@ -41,7 +41,7 @@ pub(crate) fn squeeze(text: &str) -> Squeezed {
         .collect();
     let mut tables = vec!["=== characters ===".to_string()];
     tables.extend(chars.iter().map(|c| escape(&c.to_string())));
-    Squeezed { options: Vec::new(), tables, body: Body::Lines(body) }
+    Squeezed { options: Vec::new(), tables: super::Tables::Lines(tables), body: Body::Lines(body) }
 }
 
 /// The bits a full segment takes: enough for `base^SEGMENT - 1`.

@@ -17,6 +17,7 @@ use crate::alphabet::Alphabet;
 use crate::bits::Bits;
 use crate::container::{self, Folded, Header, Line as FileLine};
 use crate::error::{FoldError, UnfoldError};
+use crate::index::Index;
 
 /// How data is made smaller before it is folded.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,7 +68,8 @@ impl Squeeze {
         matches!(self, Squeeze::Pack | Squeeze::Text | Squeeze::Table(_))
     }
 
-    /// Whether it has tables a later fold can keep (see [`crate::fold_keeping`]).
+    /// Whether it has tables a later fold can keep (see [`crate::fold_keeping`]), and so can
+    /// index (see [`crate::Fold::index`]).
     pub fn has_tables(&self) -> bool {
         matches!(self, Squeeze::Text | Squeeze::Table(_))
     }
@@ -104,17 +106,54 @@ pub(crate) enum Body {
     Stream(Vec<u8>),
 }
 
+/// A squeeze's tables before they are written: as text already, or as the models that write them
+/// once the index their values go into is known.
+pub(crate) enum Tables {
+    Lines(Vec<String>),
+    Text(text::TextCode),
+    Table(table::Table),
+}
+
+impl Tables {
+    /// The values these tables write as places in an index.
+    pub(crate) fn index_values(&self) -> Vec<String> {
+        match self {
+            Tables::Lines(_) => Vec::new(),
+            Tables::Text(code) => code.symbols(),
+            Tables::Table(table) => table.index_values(),
+        }
+    }
+
+    /// The table lines, the values that are in `index` written as their places.
+    fn lines(&self, index: Option<&Index>) -> Vec<String> {
+        match self {
+            Tables::Lines(lines) => lines.clone(),
+            Tables::Text(code) => {
+                let mut lines = vec!["=== symbols ===".to_string()];
+                lines.extend(code.table(index));
+                lines
+            }
+            Tables::Table(table) => table.header(index),
+        }
+    }
+}
+
 /// What a squeeze made: its header options, its tables, and the body.
 pub(crate) struct Squeezed {
     pub(crate) options: Vec<String>,
-    pub(crate) tables: Vec<String>,
+    pub(crate) tables: Tables,
     pub(crate) body: Body,
 }
 
+/// An earlier fold whose tables a fold keeps, and the index it was folded with.
+pub(crate) type Kept<'a> = (&'a Folded<'a>, Option<&'a Index>);
+
+/// `input`, squeezed: with the tables of `kept` when given, and allowed to index when `index`.
 pub(crate) fn squeeze(
     input: &[u8],
     squeeze: &Squeeze,
-    kept: Option<&Folded<'_>>,
+    kept: Option<Kept<'_>>,
+    index: bool,
 ) -> Result<Squeezed, FoldError> {
     let text = || {
         std::str::from_utf8(input).map_err(|error| FoldError::NotText { at: error.valid_up_to() })
@@ -122,23 +161,27 @@ pub(crate) fn squeeze(
     match squeeze {
         Squeeze::None { whole } => Ok(plain::squeeze(input, *whole)),
         Squeeze::Pack => Ok(pack::squeeze(text()?)),
-        Squeeze::Text => text::squeeze(text()?, kept),
-        Squeeze::Table(options) => table::squeeze(text()?, options, kept),
+        Squeeze::Text => text::squeeze(text()?, kept, index),
+        Squeeze::Table(options) => table::squeeze(text()?, options, kept, index),
         Squeeze::Deflate { lean } => deflate::squeeze(input, *lean),
         Squeeze::Zstd { level } => zstd::squeeze(input, *level),
     }
 }
 
 /// The folded file, with its tables deflated where that makes them smaller, unless `readable`.
+/// Values its tables put in an index are written as their places in `index`, which must hold them.
 pub(crate) fn render(
     squeeze: &str,
     squeezed: &Squeezed,
     alphabet: Alphabet,
     wrap: usize,
     readable: bool,
+    index: Option<&Index>,
 ) -> String {
-    let header =
-        Header { squeeze: squeeze.to_string(), alphabet, options: squeezed.options.clone() };
+    let index = index.filter(|_| !squeezed.tables.index_values().is_empty());
+    let mut options = squeezed.options.clone();
+    options.extend(index.map(|index| format!("index={}", index.mark())));
+    let header = Header { squeeze: squeeze.to_string(), alphabet, options };
     let body: Vec<String> = match &squeezed.body {
         Body::Lines(lines) => lines
             .iter()
@@ -151,17 +194,18 @@ pub(crate) fn render(
             .collect(),
         Body::Stream(bytes) => stream(bytes, alphabet, wrap),
     };
-    let tables = match readable || squeezed.tables.is_empty() {
-        true => squeezed.tables.clone(),
+    let lines = squeezed.tables.lines(index);
+    let tables = match readable || lines.is_empty() {
+        true => lines,
         false => {
-            let packed = deflate::deflate(squeezed.tables.join("\n").as_bytes(), &[])
+            let packed = deflate::deflate(lines.join("\n").as_bytes(), &[])
                 .expect("deflate takes any bytes");
             let mut deflated = vec![container::DEFLATED.to_string()];
             deflated.extend(stream(&packed, alphabet, wrap));
             let size = |lines: &[String]| lines.iter().map(|line| line.len() + 1).sum::<usize>();
-            match size(&deflated) < size(&squeezed.tables) {
+            match size(&deflated) < size(&lines) {
                 true => deflated,
-                false => squeezed.tables.clone(),
+                false => lines,
             }
         }
     };
@@ -178,12 +222,30 @@ fn stream(bytes: &[u8], alphabet: Alphabet, wrap: usize) -> Vec<String> {
     }
 }
 
-pub(crate) fn unsqueeze(folded: &Folded<'_>) -> Result<Vec<u8>, UnfoldError> {
+/// The index `folded` needs, from the one given: none if it needs none, and refused if it needs one
+/// and `given` isn't it.
+pub(crate) fn needed<'a>(
+    folded: &Folded<'_>,
+    given: Option<&'a Index>,
+) -> Result<Option<&'a Index>, UnfoldError> {
+    match (folded.header.value("index"), given) {
+        (None, _) => Ok(None),
+        (Some(_), None) => Err(UnfoldError::NeedsIndex),
+        (Some(mark), Some(index)) if index.fits(mark) => Ok(Some(index)),
+        (Some(_), Some(_)) => Err(UnfoldError::WrongIndex),
+    }
+}
+
+pub(crate) fn unsqueeze(
+    folded: &Folded<'_>,
+    index: Option<&Index>,
+) -> Result<Vec<u8>, UnfoldError> {
+    let index = needed(folded, index)?;
     match folded.header.squeeze.as_str() {
         "none" => plain::unsqueeze(folded),
         "pack" => pack::unsqueeze(folded),
-        "text" => text::unsqueeze(folded),
-        "table" => table::unsqueeze(folded),
+        "text" => text::unsqueeze(folded, index),
+        "table" => table::unsqueeze(folded, index),
         "deflate" => deflate::unsqueeze(folded),
         "zstd" => zstd::unsqueeze(folded),
         other => Err(UnfoldError::Header(format!("`{other}` is no squeeze this orimoji knows"))),

@@ -1,24 +1,27 @@
 //! The text squeeze: each line spelled in one Huffman code the whole file shares, and decoded on its
 //! own, so a changed line changes its own body line and no other.
 //!
-//! The code spells characters, and three things that are more than a character:
+//! The code spells characters, and runs: three or more of the same character, word or escape in
+//! a row are written once, then a `<run>` symbol and how many more, as drawings and indentation are
+//! full of them. When the fold is asked to index, it also spells two things that are more than a
+//! character, each as one symbol:
 //!
-//! - **Words.** A whole word (letters, digits, `_`) common enough to pay for its table line is one
-//!   symbol: `Simulator`, `Soundtrack`, `Entertainment`.
-//! - **Terminal escapes.** A CSI sequence (`ESC [ … m` and its kin) that occurs at least twice in
-//!   the file is one symbol, so a colour costs one code instead of a dozen characters.
-//! - **Runs.** Three or more of the same character, word or escape in a row are written once, then
-//!   a `<run>` symbol and how many more, as drawings and indentation are full of them.
+//! - **Words.** A whole word (letters, digits, `_`): `Simulator`, `Soundtrack`, `Entertainment`.
+//! - **Terminal escapes.** A CSI sequence (`ESC [ … m` and its kin), so a colour costs one code
+//!   instead of a dozen characters.
+//!
+//! Either becomes a symbol only if it saves at least twice the space its table line takes.
 //!
 //! Every code also has `<esc>`, for a character the table doesn't hold: when a fold keeps an older
 //! fold's tables, a new character is spelled as its code point instead of rebuilding the table.
 
-use super::{Body, Line, Squeezed};
+use super::{Body, Kept, Line, Squeezed, Tables};
 use crate::bits::{BitReader, BitWriter};
 use crate::container::{self, Folded, Line as FileLine};
 use crate::error::{FoldError, UnfoldError};
-use crate::escape::{escape, unescape};
+use crate::escape::escape;
 use crate::huffman::{self, Decoder, Encoder};
+use crate::index::{Index, read_entry, write_entry};
 use std::collections::{HashMap, HashSet};
 
 /// The most repeats one `<run>` stands for; a longer run is written as several. So a damaged or
@@ -53,31 +56,27 @@ enum Event<'a> {
 }
 
 impl TextCode {
-    /// The code that spells `strings` in the fewest bits.
-    pub(crate) fn learn<'a, I>(strings: I) -> Self
+    /// The code that spells `strings` in the fewest bits; with `index`, words and escapes that pay
+    /// for themselves twice over are single symbols.
+    pub(crate) fn learn<'a, I>(strings: I, index: bool) -> Self
     where
         I: IntoIterator<Item = &'a str>,
         I::IntoIter: Clone,
     {
         let strings = strings.into_iter();
-        let mut escapes: HashMap<&str, u64> = HashMap::new();
-        for string in strings.clone() {
-            for token in csi_tokens(string) {
-                *escapes.entry(token).or_default() += 1;
+        let mut tokens: HashMap<&str, u64> = HashMap::new();
+        if index {
+            for string in strings.clone() {
+                let words =
+                    string.split(|c: char| !wordy(c)).filter(|word| word.chars().nth(1).is_some());
+                for token in csi_tokens(string).chain(words) {
+                    *tokens.entry(token).or_default() += 1;
+                }
             }
         }
-        let mut words: HashMap<&str, u64> = HashMap::new();
-        for string in strings.clone() {
-            for word in
-                string.split(|c: char| !wordy(c)).filter(|word| word.chars().nth(1).is_some())
-            {
-                *words.entry(word).or_default() += 1;
-            }
-        }
-        let known: HashSet<&str> = escapes
+        let known: HashSet<&str> = tokens
             .into_iter()
-            .filter(|&(_, count)| count >= 2)
-            .chain(words.into_iter().filter(|&(word, count)| worth_a_symbol(word, count)))
+            .filter(|&(token, count)| worth_a_symbol(token, count))
             .map(|(token, _)| token)
             .collect();
         let (mut counts, mut ends, mut runs) = (HashMap::<&str, u64>::new(), 0u64, 0u64);
@@ -116,6 +115,17 @@ impl TextCode {
             })
             .collect();
         Some(Self { symbols, index, encoder, decoder, end, esc, run })
+    }
+
+    /// The symbols longer than a character: the words and escapes it indexed.
+    pub(crate) fn symbols(&self) -> Vec<String> {
+        self.symbols
+            .iter()
+            .filter_map(|symbol| match symbol {
+                Symbol::Text(text) if text.chars().nth(1).is_some() => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Spells `text`, then `<end>`.
@@ -177,12 +187,12 @@ impl TextCode {
     }
 
     /// The table, a line per symbol: its code length, a tab, and the symbol.
-    pub(crate) fn table(&self) -> Vec<String> {
+    pub(crate) fn table(&self, index: Option<&Index>) -> Vec<String> {
         let name = |symbol: &Symbol| match symbol {
             Symbol::End => "<end>".to_string(),
             Symbol::Esc => "<esc>".to_string(),
             Symbol::Run => "<run>".to_string(),
-            Symbol::Text(text) => escape(text),
+            Symbol::Text(text) => write_entry(text, index),
         };
         self.symbols
             .iter()
@@ -192,7 +202,10 @@ impl TextCode {
     }
 
     /// The code a [`TextCode::table`] describes.
-    pub(crate) fn from_table(lines: &[FileLine<'_>]) -> Result<Self, UnfoldError> {
+    pub(crate) fn from_table(
+        lines: &[FileLine<'_>],
+        index: Option<&Index>,
+    ) -> Result<Self, UnfoldError> {
         let (mut symbols, mut lengths) = (Vec::new(), Vec::new());
         for line in lines {
             let problem = |problem: String| UnfoldError::Table { line: line.number, problem };
@@ -205,7 +218,7 @@ impl TextCode {
                 "<end>" => Symbol::End,
                 "<esc>" => Symbol::Esc,
                 "<run>" => Symbol::Run,
-                _ => Symbol::Text(unescape(name).map_err(problem)?),
+                _ => Symbol::Text(read_entry(name, index).map_err(problem)?),
             });
         }
         let number = lines.first().map_or(0, |line| line.number);
@@ -221,11 +234,12 @@ fn wordy(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// Whether a word seen `count` times saves more, as one symbol, than its table line costs: a
-/// character is guessed at 5 bits and the word's own code at 12.
-fn worth_a_symbol(word: &str, count: u64) -> bool {
-    let chars = word.chars().count() as f64;
-    count as f64 * (chars * 5.0 - 12.0) / 8.0 > word.len() as f64 + 4.0
+/// Whether a word or escape seen `count` times saves, as one symbol, at least twice the space its
+/// table line takes. A character is guessed at 5 bits, the symbol's own code at 12, and a bit of
+/// the body at a sixth of a byte, as in base64.
+fn worth_a_symbol(token: &str, count: u64) -> bool {
+    let saved = count as f64 * (token.chars().count() as f64 * 5.0 - 12.0) / 6.0;
+    saved >= 2.0 * (escape(token).len() as f64 + 4.0)
 }
 
 /// The CSI sequences in `text`: `ESC [`, parameter bytes, intermediate bytes, a final byte.
@@ -294,11 +308,17 @@ fn events<'a>(units: &[&'a str]) -> Vec<Event<'a>> {
 }
 
 /// Spells every line of `text` with one code, learnt from it or kept from `kept`.
-pub(crate) fn squeeze(text: &str, kept: Option<&Folded<'_>>) -> Result<Squeezed, FoldError> {
+pub(crate) fn squeeze(
+    text: &str,
+    kept: Option<Kept<'_>>,
+    index: bool,
+) -> Result<Squeezed, FoldError> {
     let lines: Vec<&str> = text.split('\n').collect();
     let code = match kept {
-        Some(previous) => read_code(previous).map_err(FoldError::Previous)?,
-        None => TextCode::learn(lines.iter().copied().filter(|line| !line.is_empty())),
+        Some((previous, its_index)) => {
+            read_code(previous, its_index).map_err(FoldError::Previous)?
+        }
+        None => TextCode::learn(lines.iter().copied().filter(|line| !line.is_empty()), index),
     };
     let body = lines
         .iter()
@@ -311,21 +331,21 @@ pub(crate) fn squeeze(text: &str, kept: Option<&Folded<'_>>) -> Result<Squeezed,
             }
         })
         .collect();
-    let mut tables = vec!["=== symbols ===".to_string()];
-    tables.extend(code.table());
-    Ok(Squeezed { options: Vec::new(), tables, body: Body::Lines(body) })
+    Ok(Squeezed { options: Vec::new(), tables: Tables::Text(code), body: Body::Lines(body) })
 }
 
-fn read_code(folded: &Folded<'_>) -> Result<TextCode, UnfoldError> {
+fn read_code(folded: &Folded<'_>, index: Option<&Index>) -> Result<TextCode, UnfoldError> {
     let sections = container::sections(&folded.tables);
     let symbols = sections.iter().find(|(name, _)| *name == "symbols");
-    TextCode::from_table(
-        &symbols.ok_or(UnfoldError::Table { line: 1, problem: "no symbols".into() })?.1,
-    )
+    let symbols = symbols.ok_or(UnfoldError::Table { line: 1, problem: "no symbols".into() })?;
+    TextCode::from_table(&symbols.1, index)
 }
 
-pub(crate) fn unsqueeze(folded: &Folded<'_>) -> Result<Vec<u8>, UnfoldError> {
-    let code = read_code(folded)?;
+pub(crate) fn unsqueeze(
+    folded: &Folded<'_>,
+    index: Option<&Index>,
+) -> Result<Vec<u8>, UnfoldError> {
+    let code = read_code(folded, index)?;
     let mut out = Vec::new();
     for (at, line) in folded.body.iter().enumerate() {
         if at > 0 {
@@ -364,18 +384,22 @@ mod tests {
             "\u{1b}[38;2;1;2;3m██\u{1b}[0m",
             "\u{1b}[0m x \u{1b}[0m",
         ];
-        let code = TextCode::learn(strings.iter().copied());
-        for text in strings {
-            assert_eq!(spelled(&code, text).1, text);
+        for index in [false, true] {
+            let code = TextCode::learn(strings.iter().copied(), index);
+            for text in strings {
+                assert_eq!(spelled(&code, text).1, text);
+            }
         }
     }
 
     #[test]
     fn a_repeated_escape_costs_one_symbol_and_a_run_a_few_bits() {
         let colour = "\u{1b}[38;2;226;57;57m";
-        let lines = [format!("{colour}⣿"), format!("{colour}⡇")];
-        let code = TextCode::learn(lines.iter().map(String::as_str));
-        assert!(code.index.contains_key(colour), "an escape seen twice is one symbol");
+        let lines: Vec<String> = (0..6).map(|i| format!("{colour}{}", ['⣿', '⡇'][i % 2])).collect();
+        let code = TextCode::learn(lines.iter().map(String::as_str), true);
+        assert!(code.index.contains_key(colour), "an escape said six times is one symbol");
+        let plain = TextCode::learn(lines.iter().map(String::as_str), false);
+        assert!(!plain.index.contains_key(colour), "without an index, it is spelled out");
         let (long_run, _) = spelled(&code, &"⣿".repeat(500));
         assert!(long_run < 40, "500 alike take {long_run} bits");
     }
@@ -385,7 +409,7 @@ mod tests {
         let names: Vec<String> = (0..40).map(|i| format!("Farming Simulator {i}")).collect();
         let mut strings: Vec<&str> = names.iter().map(String::as_str).collect();
         strings.push("Simulators");
-        let code = TextCode::learn(strings.iter().copied());
+        let code = TextCode::learn(strings.iter().copied(), true);
         assert!(code.index.contains_key("Simulator") && code.index.contains_key("Farming"));
         let known = |token: &str| code.index.contains_key(token);
         assert_eq!(units("Farming Simulator 2", known), ["Farming", " ", "Simulator", " ", "2"]);
@@ -397,18 +421,18 @@ mod tests {
 
     #[test]
     fn a_character_the_table_lacks_is_spelled_by_its_code_point() {
-        let code = TextCode::learn(["abc"]);
+        let code = TextCode::learn(["abc"], false);
         assert_eq!(spelled(&code, "a白c").1, "a白c");
-        let table: Vec<String> = code.table();
+        let table: Vec<String> = code.table(None);
         let lines: Vec<FileLine<'_>> =
             table.iter().enumerate().map(|(at, text)| FileLine { number: at + 1, text }).collect();
-        let read = TextCode::from_table(&lines).unwrap();
+        let read = TextCode::from_table(&lines, None).unwrap();
         assert_eq!(spelled(&read, "cab\u{1b}[0m").1, "cab\u{1b}[0m");
     }
 
     #[test]
     fn a_run_longer_than_one_run_may_be_is_written_as_several() {
-        let code = TextCode::learn(["--"]);
+        let code = TextCode::learn(["--"], false);
         let long = "-".repeat(3 * LONGEST_RUN as usize + 5);
         let (bits, back) = spelled(&code, &long);
         assert_eq!(back, long);
@@ -417,7 +441,7 @@ mod tests {
 
     #[test]
     fn a_damaged_run_is_refused_rather_than_obeyed() {
-        let code = TextCode::learn(["aaaa", "b"]);
+        let code = TextCode::learn(["aaaa", "b"], false);
         let mut writer = BitWriter::new();
         code.encoder.write(&mut writer, code.index["a"]);
         code.encoder.write(&mut writer, code.run.unwrap());

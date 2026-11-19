@@ -121,6 +121,12 @@ fn inflate_tables(header: &Header, lines: &[Line<'_>]) -> Result<Vec<TableLine>,
     Ok(text.split('\n').map(|text| TableLine { number: marker, text: text.to_string() }).collect())
 }
 
+/// The header of a folded text, from its first line alone.
+pub(crate) fn header_of(folded: &str) -> Result<Header, UnfoldError> {
+    let first = folded.split('\n').next().unwrap_or_default();
+    header(first.strip_suffix('\r').unwrap_or(first))
+}
+
 fn header(line: &str) -> Result<Header, UnfoldError> {
     let inner = line.strip_prefix("=== orimoji ").and_then(|rest| rest.strip_suffix(" ==="));
     let mut words = inner.ok_or(UnfoldError::NotFolded)?.split(' ');

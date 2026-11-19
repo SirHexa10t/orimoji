@@ -1,6 +1,6 @@
-//! Canonical Huffman codes, the way arterminal's crumpled form uses them: a code length for each
-//! symbol is all a folded file stores. The codes follow from the lengths alone (shorter codes
-//! first, those of one length in symbol order, counting up), so two builds agree on every bit.
+//! Canonical Huffman codes: a code length for each symbol is all a folded file stores. The codes
+//! follow from the lengths alone (shorter codes first, those of one length in symbol order,
+//! counting up), so two builds agree on every bit.
 
 use crate::bits::{BitReader, BitWriter};
 use std::cmp::Reverse;

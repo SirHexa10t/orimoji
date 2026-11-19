@@ -5,7 +5,8 @@
 //! - `\u{…}` for any other control, and for the invisible characters (zero widths, bidi controls,
 //!   the byte order mark), so they are seen;
 //! - `\u{20}` for a space at the very end, which editors and hooks trim;
-//! - `\<` for a `<` at the very start, since a table entry spelled `<end>` is a marker;
+//! - `\<` for a `<` at the very start, since a table entry spelled `<end>` is a marker, and `\@`
+//!   for an `@` there, since `@3` is the third value of an index;
 //! - `\0` for an empty text, so an entry is never blank.
 
 /// `text` as a folded file writes it.
@@ -23,6 +24,7 @@ pub(crate) fn escape(text: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\u{1b}' => out.push_str("\\e"),
             '<' if index == 0 => out.push_str("\\<"),
+            '@' if index == 0 => out.push_str("\\@"),
             ' ' if index == last => out.push_str("\\u{20}"),
             c if c.is_control() || invisible(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
             c => out.push(c),
@@ -47,6 +49,7 @@ pub(crate) fn unescape(text: &str) -> Result<String, String> {
             Some('r') => out.push('\r'),
             Some('e') => out.push('\u{1b}'),
             Some('<') => out.push('<'),
+            Some('@') => out.push('@'),
             Some('0') => {}
             Some('u') => {
                 let rest = chars.as_str();
@@ -88,6 +91,7 @@ mod tests {
             "trailing ",
             " leading",
             "<end>",
+            "@12",
             "zero\u{200b}width",
             "bell\u{7}",
             "\r\n",
@@ -95,7 +99,7 @@ mod tests {
         ] {
             let escaped = escape(text);
             assert!(!escaped.is_empty() && !escaped.contains(['\n', '\t', '\r']), "{escaped:?}");
-            assert!(!escaped.ends_with(' ') && !escaped.starts_with('<'), "{escaped:?}");
+            assert!(!escaped.ends_with(' ') && !escaped.starts_with(['<', '@']), "{escaped:?}");
             assert_eq!(unescape(&escaped).as_deref(), Ok(text));
         }
     }

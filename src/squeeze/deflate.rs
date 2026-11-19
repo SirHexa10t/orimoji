@@ -10,7 +10,11 @@ use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, 
 pub(crate) fn squeeze(input: &[u8], lean: Option<usize>) -> Result<Squeezed, FoldError> {
     let Some(lean) = lean else {
         let body = Body::Stream(deflate(input, &[])?);
-        return Ok(Squeezed { options: super::whole(input), tables: Vec::new(), body });
+        return Ok(Squeezed {
+            options: super::whole(input),
+            tables: super::Tables::Lines(Vec::new()),
+            body,
+        });
     };
     let lines: Vec<&[u8]> = input.split(|&byte| byte == b'\n').collect();
     let mut body = Vec::with_capacity(lines.len());
@@ -22,7 +26,7 @@ pub(crate) fn squeeze(input: &[u8], lean: Option<usize>) -> Result<Squeezed, Fol
     }
     Ok(Squeezed {
         options: vec![format!("lean={lean}")],
-        tables: Vec::new(),
+        tables: super::Tables::Lines(Vec::new()),
         body: Body::Lines(body),
     })
 }

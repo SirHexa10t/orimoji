@@ -66,6 +66,12 @@ pub enum UnfoldError {
     Corrupt { line: usize, problem: String },
     /// It was squeezed with zstd, which this build lacks.
     NoZstd,
+    /// It was folded with an index, and none was given.
+    NeedsIndex,
+    /// The index given isn't the one it was folded with.
+    WrongIndex,
+    /// An index's text doesn't read.
+    Index(String),
 }
 
 impl fmt::Display for UnfoldError {
@@ -85,6 +91,13 @@ impl fmt::Display for UnfoldError {
             UnfoldError::NoZstd => {
                 write!(f, "it was squeezed with zstd, and this build of orimoji has none")
             }
+            UnfoldError::NeedsIndex => {
+                write!(f, "it was folded with an index, and unfolding it needs that index")
+            }
+            UnfoldError::WrongIndex => {
+                write!(f, "the index given isn't the one it was folded with")
+            }
+            UnfoldError::Index(why) => write!(f, "the index: {why}"),
         }
     }
 }

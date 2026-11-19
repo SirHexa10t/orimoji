@@ -1,10 +1,12 @@
-//! The table squeeze, for text in columns, like catalogames' listing of Steam's catalogue: a row a
+//! The table squeeze, for text in columns, like a tab-separated listing of a catalogue: a row a
 //! line, and each column in a model of its own, chosen for it and shared by the whole file.
 //!
 //! A column's cells are coded one of a few ways, whichever costs the fewest bytes, tables included:
 //!
-//! - **Values:** the cells that repeat, as a Huffman-coded word list: the README's "words from a
-//!   fixed list", learnt from the file. A cell off the list is coded by the column's fallback.
+//! - **Values,** when the fold is asked to index: the cells that repeat, as a Huffman-coded word
+//!   list, the "words from a fixed list" of docs/theory.md learnt from the file. A value is listed only if
+//!   it saves at least twice the space its table line takes, and a list is dropped if it takes over
+//!   half the space it saves. A cell off the list is coded by the column's fallback.
 //! - **Fallbacks:** `spell`, the cell spelled out in a character code the file shares; `number`,
 //!   for counts and ids, as its bit length and then its bits; or `delta`, the same for how far it
 //!   is from the number above it, which suits a sorted column (an edit then changes its row and the
@@ -20,12 +22,13 @@
 //! readable, behind a space, which no alphabet has.
 
 use super::text::TextCode;
-use super::{Body, Line, Squeezed};
+use super::{Body, Kept, Line, Squeezed, Tables};
 use crate::bits::{BitReader, BitWriter};
 use crate::container::{self, Folded, Line as FileLine};
 use crate::error::{FoldError, UnfoldError};
 use crate::escape::{escape, unescape};
 use crate::huffman::{self, Decoder, Encoder};
+use crate::index::{Index, read_entry, write_entry};
 use std::collections::{HashMap, HashSet};
 
 /// How a table squeeze reads its input.
@@ -337,13 +340,33 @@ struct Plan {
     classes: [u64; CLASSES],
 }
 
-/// The cheapest model for these cells, in row order.
-fn plan(cells: &[&str]) -> Plan {
+/// A plan and its cost in bytes: the body and the tables, but for its list of values; then that
+/// list on its own.
+struct Costed {
+    plan: Plan,
+    body: f64,
+    list: f64,
+}
+
+impl Costed {
+    fn total(&self) -> f64 {
+        self.body + self.list
+    }
+}
+
+/// The cheapest model for these cells, in row order. With `index`, a model may list the column's
+/// common values, as long as the list takes at most half the space it saves.
+fn plan(cells: &[&str], index: bool) -> Plan {
     let mut lists = vec![None];
     lists.extend(
         [',', ';'].into_iter().filter(|&s| cells.iter().any(|cell| cell.contains(s))).map(Some),
     );
-    let mut best: Option<(f64, Plan)> = None;
+    let mut best: Option<Costed> = None;
+    let mut consider = |costed: Costed| {
+        if best.as_ref().is_none_or(|least| costed.total() < least.total()) {
+            best = Some(costed);
+        }
+    };
     for list in lists {
         let (mut counts, mut total, mut numbers) = (HashMap::<&str, u64>::new(), 0u64, 0u64);
         for &cell in cells {
@@ -358,29 +381,40 @@ fn plan(cells: &[&str]) -> Plan {
             false => &[Kind::Spell][..],
         };
         for &kind in kinds {
-            let (cost, plan) = evaluate(cells, list, kind, &counts, total);
-            if best.as_ref().is_none_or(|(least, _)| cost < *least) {
-                best = Some((cost, plan));
+            let plain = evaluate(cells, list, kind, Vec::new());
+            if index {
+                let dictionary = listable(&counts, total, kind);
+                if !dictionary.is_empty() {
+                    let listed = evaluate(cells, list, kind, dictionary);
+                    if listed.list <= (plain.body - listed.body) / 2.0 {
+                        consider(listed);
+                    }
+                }
             }
+            consider(plain);
         }
     }
-    best.expect("there is always the plain model").1
+    best.expect("there is always the plain model").plan
 }
 
-/// What a model would cost these cells, in bytes, and the model.
-fn evaluate(
-    cells: &[&str],
-    list: Option<char>,
-    kind: Kind,
-    counts: &HashMap<&str, u64>,
-    total: u64,
-) -> (f64, Plan) {
+/// The units worth listing: those that save at least twice the space their table line takes.
+fn listable(counts: &HashMap<&str, u64>, total: u64, kind: Kind) -> Vec<(String, u64)> {
     let mut dictionary: Vec<(String, u64)> = counts
         .iter()
         .filter(|&(&unit, &count)| count >= 2 && worth_listing(unit, count, total, kind))
         .map(|(&unit, &count)| (unit.to_string(), count))
         .collect();
     dictionary.sort_unstable();
+    dictionary
+}
+
+/// What a model would cost these cells, listing `dictionary`.
+fn evaluate(
+    cells: &[&str],
+    list: Option<char>,
+    kind: Kind,
+    dictionary: Vec<(String, u64)>,
+) -> Costed {
     let listed: HashSet<&str> = dictionary.iter().map(|(unit, _)| unit.as_str()).collect();
     let (mut misses, mut bits, mut classes) = (0u64, 0f64, [0u64; CLASSES]);
     let mut above = 0u64;
@@ -418,19 +452,25 @@ fn evaluate(
     if kind != Kind::Spell {
         bits += coded_bits(&classes.map(|count| count + 1));
     }
-    let entries: f64 = dictionary.iter().map(|(unit, _)| escape(unit).len() as f64 + 4.0).sum();
-    let header = entries + if kind == Kind::Spell { 0.0 } else { 200.0 } + 30.0;
-    (bits * BYTES_PER_BIT + header, Plan { list, kind, dictionary, misses, ends, classes })
+    let entries: f64 = dictionary.iter().map(|(unit, _)| entry_bytes(unit)).sum();
+    let tables = if kind == Kind::Spell { 0.0 } else { 200.0 } + 30.0;
+    let plan = Plan { list, kind, dictionary, misses, ends, classes };
+    Costed { plan, body: bits * BYTES_PER_BIT + tables, list: entries }
 }
 
-/// Whether listing `unit` saves more body than its table line costs.
+/// The bytes a value's table line takes: its code length, a tab, the value, a newline.
+fn entry_bytes(unit: &str) -> f64 {
+    escape(unit).len() as f64 + 4.0
+}
+
+/// Whether listing `unit` saves at least twice the space its table line takes.
 fn worth_listing(unit: &str, count: u64, total: u64, kind: Kind) -> bool {
     let fallback = match (kind, number(unit)) {
         (Kind::Spell, _) | (_, None) => spell_bits(unit),
         (_, Some(number)) => 4.0 + bit_length(number).saturating_sub(1) as f64,
     };
     let listed = (total as f64 / count as f64).log2() + 1.0;
-    count as f64 * (fallback - listed) * BYTES_PER_BIT > escape(unit).len() as f64 + 4.0
+    count as f64 * (fallback - listed) * BYTES_PER_BIT >= 2.0 * entry_bytes(unit)
 }
 
 fn spell_bits(unit: &str) -> f64 {
@@ -466,7 +506,7 @@ fn build(plan: Plan) -> Column {
 
 /// A table's models: how its rows split, how each column is coded, and the spelling they share.
 #[derive(Debug)]
-struct Table {
+pub(crate) struct Table {
     separator: char,
     keep: Option<String>,
     columns: Vec<Column>,
@@ -479,7 +519,7 @@ impl Table {
         row(line, self.separator, self.keep.as_deref(), self.columns.len())
     }
 
-    fn learn(lines: &[&str], options: &TableOptions) -> Result<Self, FoldError> {
+    fn learn(lines: &[&str], options: &TableOptions, index: bool) -> Result<Self, FoldError> {
         let keep = options.keep.as_deref();
         let mut widths: HashMap<usize, usize> = HashMap::new();
         for line in lines
@@ -496,7 +536,7 @@ impl Table {
         let rows: Vec<Vec<&str>> =
             lines.iter().filter_map(|line| row(line, options.separator, keep, width)).collect();
         let columns: Vec<Column> = (0..width)
-            .map(|at| build(plan(&rows.iter().map(|row| row[at]).collect::<Vec<_>>())))
+            .map(|at| build(plan(&rows.iter().map(|row| row[at]).collect::<Vec<_>>(), index)))
             .collect();
         let mut spelled = Vec::new();
         let mut above = vec![0u64; width];
@@ -505,7 +545,7 @@ impl Table {
                 columns[at].spelled(cell, &mut above[at], &mut spelled);
             }
         }
-        let spell = TextCode::learn(spelled.iter().copied());
+        let spell = TextCode::learn(spelled.iter().copied(), index);
         Ok(Self { separator: options.separator, keep: options.keep.clone(), columns, spell })
     }
 
@@ -529,7 +569,22 @@ impl Table {
             .collect()
     }
 
-    fn header(&self) -> Vec<String> {
+    /// The values its lists and spelling put in an index.
+    pub(crate) fn index_values(&self) -> Vec<String> {
+        let listed = self.columns.iter().filter_map(|column| column.values.as_ref());
+        let mut values: Vec<String> = listed
+            .flat_map(|values| values.entries.iter())
+            .filter_map(|entry| match entry {
+                Entry::Value(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        values.extend(self.spell.symbols());
+        values
+    }
+
+    /// The tables, the values that are in `index` written as their places.
+    pub(crate) fn header(&self, index: Option<&Index>) -> Vec<String> {
         let mut out = vec![
             "=== table ===".to_string(),
             format!("separator\t{}", escape(&self.separator.to_string())),
@@ -557,17 +612,17 @@ impl Table {
                     out.push(match entry {
                         Entry::Esc => format!("{length}\t<esc>"),
                         Entry::End => format!("{length}\t<end>"),
-                        Entry::Value(value) => format!("{length}\t{}", escape(value)),
+                        Entry::Value(value) => format!("{length}\t{}", write_entry(value, index)),
                     });
                 }
             }
         }
         out.push("=== spell ===".to_string());
-        out.extend(self.spell.table());
+        out.extend(self.spell.table(index));
         out
     }
 
-    fn read(folded: &Folded<'_>) -> Result<Self, UnfoldError> {
+    fn read(folded: &Folded<'_>, index: Option<&Index>) -> Result<Self, UnfoldError> {
         let sections = container::sections(&folded.tables);
         let section =
             |name: &str| sections.iter().find(|(found, _)| *found == name).map(|(_, lines)| lines);
@@ -616,6 +671,7 @@ impl Table {
                     Some(read_values(
                         section(&name).ok_or_else(|| missing(&name))?,
                         list.is_some(),
+                        index,
                     )?)
                 }
             };
@@ -639,7 +695,7 @@ impl Table {
             };
             columns.push(Column { list, values, kind, numbers });
         }
-        let spell = TextCode::from_table(section("spell").ok_or_else(|| missing("spell"))?)?;
+        let spell = TextCode::from_table(section("spell").ok_or_else(|| missing("spell"))?, index)?;
         Ok(Self { separator, keep, columns, spell })
     }
 }
@@ -682,7 +738,11 @@ fn describe(words: &[&str]) -> Option<(Option<char>, bool, Kind)> {
     Some((list, has_values, kind))
 }
 
-fn read_values(lines: &[FileLine<'_>], list: bool) -> Result<Values, UnfoldError> {
+fn read_values(
+    lines: &[FileLine<'_>],
+    list: bool,
+    index: Option<&Index>,
+) -> Result<Values, UnfoldError> {
     let (mut entries, mut lengths) =
         (Vec::with_capacity(lines.len()), Vec::with_capacity(lines.len()));
     for line in lines {
@@ -692,7 +752,7 @@ fn read_values(lines: &[FileLine<'_>], list: bool) -> Result<Values, UnfoldError
         entries.push(match text {
             "<esc>" => Entry::Esc,
             "<end>" => Entry::End,
-            _ => Entry::Value(unescape(text).map_err(problem)?),
+            _ => Entry::Value(read_entry(text, index).map_err(problem)?),
         });
     }
     let line = lines.first().map_or(1, |line| line.number);
@@ -709,22 +769,25 @@ fn read_values(lines: &[FileLine<'_>], list: bool) -> Result<Values, UnfoldError
 pub(crate) fn squeeze(
     text: &str,
     options: &TableOptions,
-    kept: Option<&Folded<'_>>,
+    kept: Option<Kept<'_>>,
+    index: bool,
 ) -> Result<Squeezed, FoldError> {
     let lines: Vec<&str> = text.split('\n').collect();
     let table = match kept {
-        Some(previous) => Table::read(previous).map_err(FoldError::Previous)?,
-        None => Table::learn(&lines, options)?,
+        Some((previous, its_index)) => {
+            Table::read(previous, its_index).map_err(FoldError::Previous)?
+        }
+        None => Table::learn(&lines, options, index)?,
     };
-    Ok(Squeezed {
-        options: Vec::new(),
-        tables: table.header(),
-        body: Body::Lines(table.encode(&lines)),
-    })
+    let body = Body::Lines(table.encode(&lines));
+    Ok(Squeezed { options: Vec::new(), tables: Tables::Table(table), body })
 }
 
-pub(crate) fn unsqueeze(folded: &Folded<'_>) -> Result<Vec<u8>, UnfoldError> {
-    let table = Table::read(folded)?;
+pub(crate) fn unsqueeze(
+    folded: &Folded<'_>,
+    index: Option<&Index>,
+) -> Result<Vec<u8>, UnfoldError> {
+    let table = Table::read(folded, index)?;
     let separator = table.separator.to_string();
     let mut above = vec![0u64; table.columns.len()];
     let mut out = String::new();
@@ -779,16 +842,36 @@ mod tests {
     fn a_column_of_few_values_gets_a_list_of_them() {
         let cells: Vec<&str> =
             (0..500).map(|i| ["Valve", "Gearbox Software", "?"][i % 3]).collect();
-        let plan = plan(&cells);
+        let plan = plan(&cells, true);
         assert_eq!(plan.kind, Kind::Spell);
         assert_eq!(plan.dictionary.len(), 3);
+    }
+
+    #[test]
+    fn without_index_no_column_lists_its_values() {
+        let cells: Vec<&str> =
+            (0..500).map(|i| ["Valve", "Gearbox Software", "?"][i % 3]).collect();
+        assert!(plan(&cells, false).dictionary.is_empty());
+    }
+
+    #[test]
+    fn a_list_that_saves_less_than_twice_its_size_is_left_out() {
+        // Each long value comes back twice: listing it saves a little, but not twice its line.
+        let values: Vec<String> =
+            (0..200).map(|i| format!("a studio with a long name and number {i}")).collect();
+        let cells: Vec<&str> = values.iter().chain(&values).map(String::as_str).collect();
+        assert!(plan(&cells, true).dictionary.is_empty());
+        // Said fifty times each, they pay for themselves many times over.
+        let cells: Vec<&str> =
+            (0..50).flat_map(|_| values[..4].iter().map(String::as_str)).collect();
+        assert_eq!(plan(&cells, true).dictionary.len(), 4);
     }
 
     #[test]
     fn a_sorted_column_of_ids_is_coded_by_distance() {
         let cells: Vec<String> = (0..2000u64).map(|i| (10 + i * 10 + i % 7).to_string()).collect();
         let cells: Vec<&str> = cells.iter().map(String::as_str).collect();
-        assert_eq!(plan(&cells).kind, Kind::Delta);
+        assert_eq!(plan(&cells, true).kind, Kind::Delta);
     }
 
     #[test]
@@ -810,7 +893,7 @@ mod tests {
             cells.push(picked.join(","));
         }
         let cells: Vec<&str> = cells.iter().map(String::as_str).collect();
-        let plan = plan(&cells);
+        let plan = plan(&cells, true);
         assert_eq!(plan.list, Some(','));
         assert!(plan.dictionary.len() >= 15);
     }

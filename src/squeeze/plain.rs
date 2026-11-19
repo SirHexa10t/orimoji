@@ -21,7 +21,7 @@ pub(crate) fn squeeze(input: &[u8], whole: bool) -> Squeezed {
         true => super::whole(input),
         false => Vec::new(),
     };
-    Squeezed { options, tables: Vec::new(), body }
+    Squeezed { options, tables: super::Tables::Lines(Vec::new()), body }
 }
 
 pub(crate) fn unsqueeze(folded: &Folded<'_>) -> Result<Vec<u8>, UnfoldError> {

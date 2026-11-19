@@ -67,7 +67,7 @@ fn folding_like_an_earlier_fold_changes_only_the_lines_that_changed() {
         (std::fs::read_to_string(&before).unwrap(), std::fs::read_to_string(&after).unwrap());
     let differing = old.lines().zip(new.lines()).filter(|(a, b)| a != b).count();
     assert_eq!(differing, 1, "only the changed row's line differs:\n{old}\n{new}");
-    let (ok, back, _) = orimoji(&["unfold", after.to_str().unwrap()], b"");
+    let (ok, back, _) = orimoji(&["unfold", after.to_str().unwrap(), "-o", "-"], b"");
     assert!(ok);
     assert_eq!(back, changed.as_bytes());
     std::fs::remove_dir_all(dir).unwrap();
@@ -96,4 +96,58 @@ fn the_alphabets_and_a_measurement_are_printed_as_tables() {
         out.contains("(the input itself)") && out.contains("table") && out.contains("zstd"),
         "{out}"
     );
+}
+
+#[test]
+fn files_and_the_index_they_share_fold_and_unfold_on_the_command_line() {
+    let dir = scratch("files");
+    let rows = |offset: usize| -> String {
+        (0..300)
+            .map(|i| {
+                format!("{}\t{}\n", i + offset, ["Valve", "Gearbox Software", "Bethesda"][i % 3])
+            })
+            .collect()
+    };
+    let (a, b, index) = (dir.join("a.tsv"), dir.join("b.tsv"), dir.join("studios.index"));
+    std::fs::write(&a, rows(0)).unwrap();
+    std::fs::write(&b, rows(1000)).unwrap();
+    let (ok, _, said) = orimoji(
+        &[
+            "fold",
+            "-s",
+            "table",
+            "--index",
+            index.to_str().unwrap(),
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+        ],
+        b"",
+    );
+    assert!(ok, "{said}");
+    assert!(said.contains("2 files written") && said.contains("the index, 3 values"), "{said}");
+    let kept = std::fs::read_to_string(&index).unwrap();
+    assert_eq!(kept, "=== orimoji index 1 ===\nBethesda\nGearbox Software\nValve\n");
+    std::fs::remove_file(&a).unwrap();
+    std::fs::remove_file(&b).unwrap();
+    let (a_folded, b_folded) = (dir.join("a.tsv.folded"), dir.join("b.tsv.folded"));
+    let folded = [a_folded.to_str().unwrap(), b_folded.to_str().unwrap()];
+    let (ok, _, said) = orimoji(&["unfold", folded[0], folded[1]], b"");
+    assert!(!ok && said.contains("needs that index") && said.contains("--index"), "{said}");
+    let (ok, _, said) =
+        orimoji(&["unfold", "--index", index.to_str().unwrap(), folded[0], folded[1]], b"");
+    assert!(ok, "{said}");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), rows(0));
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), rows(1000));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn an_index_asked_for_but_not_worth_it_is_not_written() {
+    let dir = scratch("no-index");
+    let index = dir.join("unused.index");
+    let (ok, _, said) =
+        orimoji(&["fold", "-s", "text", "--index", index.to_str().unwrap()], b"one line\n");
+    assert!(ok && said.contains("no list paid for itself"), "{said}");
+    assert!(!index.exists());
+    std::fs::remove_dir_all(dir).unwrap();
 }

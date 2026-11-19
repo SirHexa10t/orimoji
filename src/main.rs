@@ -1,10 +1,11 @@
 //! The `orimoji` command: a thin shell over the crate.
 
 use clap::{Args, Parser, Subcommand};
+use orimoji::files::{self, Output};
 use orimoji::measure::{self, Measurement};
-use orimoji::{Alphabet, Fold, Squeeze, TableOptions};
+use orimoji::{Alphabet, Fold, Index, Indexing, Squeeze, TableOptions, UnfoldError};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Fold text and data into fewer characters, fewer bytes or narrower lines, and unfold it back
@@ -18,16 +19,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Fold a file, or standard input, onto standard output (or --output).
+    /// Fold standard input onto standard output, or files beside themselves (`FILE.folded`) or,
+    /// with --in-place, over themselves.
     Fold(FoldArgs),
-    /// Unfold a folded file, or standard input, back into what was folded.
-    Unfold {
-        /// The folded file; standard input when left out.
-        input: Option<PathBuf>,
-        /// Where to write what it holds; standard output when left out.
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
+    /// Unfold standard input onto standard output, or folded files beside themselves (taking
+    /// `.folded` off) or, with --in-place, over themselves.
+    Unfold(UnfoldArgs),
     /// Fold a file every way and compare: characters, bytes, screen width, and what git stores.
     Measure {
         /// The file; standard input when left out.
@@ -40,13 +37,49 @@ enum Command {
     Alphabets,
 }
 
+/// What to read, and where to write.
+#[derive(Args)]
+struct Files {
+    /// The files; standard input when there are none.
+    files: Vec<PathBuf>,
+    /// Write here instead: for standard input, or a single file.
+    #[arg(short, long, conflicts_with = "in_place")]
+    output: Option<PathBuf>,
+    /// Write over the files themselves, not beside them.
+    #[arg(long)]
+    in_place: bool,
+    /// The suffix of the files written beside them: a fold adds it, an unfold takes it off.
+    #[arg(long, default_value = files::SUFFIX)]
+    suffix: String,
+}
+
+impl Files {
+    fn output(&self) -> Output {
+        match self.in_place {
+            true => Output::InPlace,
+            false => Output::Suffix(self.suffix.clone()),
+        }
+    }
+
+    /// Whether what comes in and goes out is one stream: standard input, or a single file to
+    /// `--output`.
+    fn one_stream(&self) -> Result<bool, String> {
+        match (self.files.len(), &self.output) {
+            (0, _) => Ok(true),
+            (1, Some(_)) => Ok(true),
+            (_, Some(_)) => {
+                Err("--output takes one input; several files are written beside or over themselves"
+                    .into())
+            }
+            (_, None) => Ok(false),
+        }
+    }
+}
+
 #[derive(Args)]
 struct FoldArgs {
-    /// The file to fold; standard input when left out.
-    input: Option<PathBuf>,
-    /// Where to write the folded file; standard output when left out.
-    #[arg(short, long)]
-    output: Option<PathBuf>,
+    #[command(flatten)]
+    files: Files,
     /// How to make it smaller first: auto (the smallest line by line), none, pack, text, table,
     /// deflate or zstd.
     #[arg(short, long, default_value = "auto")]
@@ -54,6 +87,13 @@ struct FoldArgs {
     /// The alphabet to fold into; see `orimoji alphabets`.
     #[arg(short, long, default_value = "base64url")]
     alphabet: String,
+    /// Index, and keep the index in FILE: written only if a list paid for itself. Files folded
+    /// together share it. With --like, the earlier fold's index, which is kept as it is.
+    #[arg(long, value_name = "FILE")]
+    index: Option<PathBuf>,
+    /// Keep the tables of this earlier fold, so lines that didn't change fold the same.
+    #[arg(long, value_name = "FOLDED")]
+    like: Option<PathBuf>,
     /// Squeeze the whole file as one stream (none, deflate; zstd always does): smaller, but any
     /// edit changes the folded file from there on.
     #[arg(long)]
@@ -67,9 +107,6 @@ struct FoldArgs {
     /// For a table: keep lines starting with this as they are (empty for none).
     #[arg(long, default_value = "#")]
     keep: String,
-    /// Keep the tables of this earlier fold, so lines that didn't change fold the same.
-    #[arg(long)]
-    like: Option<PathBuf>,
     /// The screen cells a body line takes when the body is one stream.
     #[arg(long, default_value_t = 100)]
     wrap: usize,
@@ -82,6 +119,15 @@ struct FoldArgs {
     /// Say nothing on standard error about how it went.
     #[arg(short, long)]
     quiet: bool,
+}
+
+#[derive(Args)]
+struct UnfoldArgs {
+    #[command(flatten)]
+    files: Files,
+    /// The index the input was folded with, if it needs one.
+    #[arg(long, value_name = "FILE")]
+    index: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -97,11 +143,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Fold(args) => fold(args),
-        Command::Unfold { input, output } => {
-            let folded = String::from_utf8(read(input.as_ref())?)
-                .map_err(|_| "a folded file is UTF-8, and this isn't")?;
-            Ok(write(output.as_ref(), &orimoji::unfold(&folded)?)?)
-        }
+        Command::Unfold(args) => unfold(args),
         Command::Measure { input, alphabets } => {
             let alphabets = alphabet_list(&alphabets)?;
             print_measurements(&measure::measure(&read(input.as_ref())?, &alphabets));
@@ -115,15 +157,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn fold(args: FoldArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let input = read(args.input.as_ref())?;
+    let one_stream = args.files.one_stream()?;
     let alphabet = Alphabet::from_name(&args.alphabet)
         .ok_or_else(|| format!("`{}` is no alphabet", args.alphabet))?;
-    let previous = match &args.like {
-        Some(path) => Some(
-            String::from_utf8(std::fs::read(path)?)
-                .map_err(|_| "the fold to keep tables from isn't UTF-8")?,
-        ),
-        None => None,
+    let previous = args.like.as_ref().map(read_text).transpose()?;
+    if previous.is_some() && args.files.files.len() > 1 {
+        return Err("--like keeps the tables of one fold, for one input".into());
+    }
+    let inputs: Vec<Vec<u8>> = match args.files.files.is_empty() {
+        true => vec![read(None)?],
+        false => args.files.files.iter().map(std::fs::read).collect::<Result<_, _>>()?,
     };
     let name = match (args.squeeze.as_str(), &previous) {
         // Keeping tables means keeping the squeeze they belong to.
@@ -143,8 +186,9 @@ fn fold(args: FoldArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
         keep: (!args.keep.is_empty()).then(|| args.keep.clone()),
     };
+    let asked = args.index.is_some() && previous.is_none();
     let squeeze = match name.as_str() {
-        "auto" => orimoji::pick(&input, alphabet),
+        "auto" => orimoji::pick(&inputs.concat(), alphabet, asked),
         "none" => Squeeze::None { whole: args.whole },
         "pack" => Squeeze::Pack,
         "text" => Squeeze::Text,
@@ -158,24 +202,136 @@ fn fold(args: FoldArgs) -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     };
-    let how = Fold { squeeze, alphabet, wrap: args.wrap, readable: args.readable };
-    let folded = match &previous {
-        Some(previous) => orimoji::fold_keeping(&input, previous, &how)?,
-        None => orimoji::fold(&input, &how)?,
+    let how = Fold { squeeze, alphabet, wrap: args.wrap, readable: args.readable, index: asked };
+    let said = |input: usize, folded: usize, written: &str| {
+        if !args.quiet {
+            eprintln!(
+                "orimoji: {input} bytes folded into {folded} ({:.0}%), with {} into {alphabet}{}{written}",
+                100.0 * folded as f64 / input.max(1) as f64,
+                how.squeeze.describe(),
+                if how.squeeze.by_line() { ", a line for each line" } else { "" },
+            );
+        }
     };
-    write(args.output.as_ref(), folded.as_bytes())?;
-    if !args.quiet {
-        eprintln!(
-            "orimoji: {} bytes folded into {} ({:.0}%), with {} into {}{}",
-            input.len(),
-            folded.len(),
-            100.0 * folded.len() as f64 / input.len().max(1) as f64,
-            how.squeeze.describe(),
-            alphabet,
-            if how.squeeze.by_line() { ", a line for each line" } else { "" },
-        );
+    if let Some(previous) = &previous {
+        let index = match orimoji::needs_index(previous)? {
+            true => Some(read_index(
+                args.index.as_ref().ok_or("the earlier fold needs its index: --index FILE")?,
+            )?),
+            false => None,
+        };
+        let text = orimoji::fold_keeping(&inputs[0], previous, index.as_ref(), &how)?;
+        let target = match one_stream {
+            true => args.files.output.clone(),
+            false => Some(written_beside(&args.files.files[0], &args.files.output())),
+        };
+        write(target.as_ref(), text.as_bytes())?;
+        said(inputs[0].len(), text.len(), "");
+        return Ok(());
+    }
+    let indexing = match one_stream {
+        true => {
+            let folded = orimoji::fold(&inputs[0], &how)?;
+            write(args.files.output.as_ref(), folded.text.as_bytes())?;
+            said(inputs[0].len(), folded.text.len(), "");
+            folded.indexing
+        }
+        false => {
+            let folded = files::fold_files(&args.files.files, &how, &args.files.output())?;
+            let size: usize = folded
+                .written
+                .iter()
+                .map(|path| std::fs::metadata(path).map_or(0, |m| m.len() as usize))
+                .sum();
+            let input: usize = inputs.iter().map(Vec::len).sum();
+            let files = folded.written.len();
+            said(
+                input,
+                size,
+                &format!(", {files} file{} written", if files == 1 { "" } else { "s" }),
+            );
+            folded.indexing
+        }
+    };
+    keep_index(&indexing, args.index.as_deref(), args.quiet)?;
+    Ok(())
+}
+
+/// Writes the index a fold made where the caller asked, or says why there is none.
+fn keep_index(indexing: &Indexing, path: Option<&Path>, quiet: bool) -> std::io::Result<()> {
+    match (indexing, path) {
+        (Indexing::Index(index), Some(path)) => {
+            std::fs::write(path, index.to_text())?;
+            if !quiet {
+                eprintln!("orimoji: the index, {} values, is in {}", index.len(), path.display());
+            }
+        }
+        (Indexing::Unneeded, Some(path)) if !quiet => eprintln!(
+            "orimoji: no list paid for itself, so there is no index: {} wasn't written, and the folded text unfolds without one",
+            path.display()
+        ),
+        _ => {}
     }
     Ok(())
+}
+
+fn unfold(args: UnfoldArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let one_stream = args.files.one_stream()?;
+    let index = args.index.as_ref().map(read_index).transpose()?;
+    let hint = |error: UnfoldError| -> Box<dyn std::error::Error> {
+        match error {
+            UnfoldError::NeedsIndex => format!("{error}: give it with --index FILE").into(),
+            error => error.into(),
+        }
+    };
+    if one_stream {
+        let path = args.files.files.first();
+        let text = read_text(path.cloned().unwrap_or_else(|| PathBuf::from("-")))?;
+        let unfolded = orimoji::unfold(&text, index.as_ref()).map_err(hint)?;
+        return Ok(write(args.files.output.as_ref(), &unfolded)?);
+    }
+    files::unfold_files(&args.files.files, index.as_ref(), &args.files.output()).map_err(
+        |error| -> Box<dyn std::error::Error> {
+            match error {
+                files::FilesError::Unfold { path, error: UnfoldError::NeedsIndex } => format!(
+                    "{}: {}: give it with --index FILE",
+                    path.display(),
+                    UnfoldError::NeedsIndex
+                )
+                .into(),
+                error => error.into(),
+            }
+        },
+    )?;
+    Ok(())
+}
+
+/// Where a fold of `path` is written, as `output` says.
+fn written_beside(path: &Path, output: &Output) -> PathBuf {
+    match output {
+        Output::InPlace => path.to_path_buf(),
+        Output::Suffix(suffix) => {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            path.with_file_name(format!("{name}{suffix}"))
+        }
+    }
+}
+
+fn read_text(path: impl AsRef<Path>) -> Result<String, Box<dyn std::error::Error>> {
+    let path = path.as_ref();
+    let bytes = read(Some(&path.to_path_buf()))?;
+    String::from_utf8(bytes)
+        .map_err(|_| format!("{}: a folded file is UTF-8, and this isn't", path.display()).into())
+}
+
+fn read_index(path: impl AsRef<Path>) -> Result<Index, Box<dyn std::error::Error>> {
+    let path = path.as_ref();
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(Index::from_text(&text).map_err(|error| format!("{}: {error}", path.display()))?)
 }
 
 fn read(path: Option<&PathBuf>) -> std::io::Result<Vec<u8>> {
@@ -239,8 +395,11 @@ fn print_measurements(measurements: &[Measurement]) {
         "squeeze", "alphabet", "diff", "bytes", "", "width", "", "in git", ""
     );
     for m in measurements {
-        let squeeze =
-            m.squeeze.as_ref().map_or("(the input itself)".to_string(), Squeeze::describe);
+        let squeeze = match &m.squeeze {
+            None => "(the input itself)".to_string(),
+            Some(squeeze) if m.index => format!("{}, indexed", squeeze.describe()),
+            Some(squeeze) => squeeze.describe(),
+        };
         let alphabet = m.alphabet.map_or("", Alphabet::name);
         let diffs = m.squeeze.as_ref().is_none_or(Squeeze::by_line);
         println!(

@@ -10,7 +10,7 @@ pub(crate) fn squeeze(input: &[u8], level: i32) -> Result<Squeezed, FoldError> {
         .map_err(|error| FoldError::Compressor(error.to_string()))?;
     Ok(Squeezed {
         options: super::whole(input),
-        tables: Vec::new(),
+        tables: super::Tables::Lines(Vec::new()),
         body: super::Body::Stream(packed),
     })
 }

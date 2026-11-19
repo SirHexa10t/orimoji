@@ -1,6 +1,6 @@
 # A library first, like its siblings: the `orimoji` binary is a thin shell over the crate, so a
-# program embedding it (arterminal, catalogames) reaches every fold the command line does. Every
-# dependency below carries the reason it is here.
+# program embedding it reaches every fold the command line does. Every dependency below carries the
+# reason it is here.
 [package]
 name = "orimoji"
 version = "0.1.0"

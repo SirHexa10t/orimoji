@@ -1,15 +1,20 @@
 //! What each squeeze and alphabet makes of an input: characters, bytes, screen width, and the bytes
-//! git would store for it, since git keeps every object zlib-compressed. `orimoji measure` prints
-//! it; the README's tables were made the same way.
+//! git would store for it, since git keeps every object zlib-compressed. An indexed fold is
+//! measured with its index, which the caller has to keep too. `orimoji measure` prints
+//! it; the tables in docs/observations.md were made the same way.
 
 use crate::alphabet::Alphabet;
+use crate::index::Index;
 use crate::squeeze::{self, Squeeze, TableOptions};
+use std::collections::BTreeSet;
 
 /// One fold of the input, measured.
 #[derive(Clone, Debug)]
 pub struct Measurement {
     /// The squeeze, or `None` for the input itself.
     pub squeeze: Option<Squeeze>,
+    /// Whether the squeeze was allowed to index (see [`crate::Fold::index`]).
+    pub index: bool,
     pub alphabet: Option<Alphabet>,
     pub chars: usize,
     pub bytes: usize,
@@ -20,10 +25,11 @@ pub struct Measurement {
 }
 
 impl Measurement {
-    fn of(text: &[u8], squeeze: Option<Squeeze>, alphabet: Option<Alphabet>) -> Self {
+    fn of(text: &[u8], squeeze: Option<Squeeze>, index: bool, alphabet: Option<Alphabet>) -> Self {
         let as_text = String::from_utf8_lossy(text);
         Self {
             squeeze,
+            index,
             alphabet,
             chars: as_text.chars().count(),
             bytes: text.len(),
@@ -50,14 +56,25 @@ pub fn squeezes(input: &[u8]) -> Vec<Squeeze> {
     squeezes
 }
 
-/// The input itself, then every squeeze that takes it in every one of `alphabets`, measured.
+/// The input itself, then every squeeze that takes it in every one of `alphabets`, measured; the
+/// squeezes that can index, both without and with.
 pub fn measure(input: &[u8], alphabets: &[Alphabet]) -> Vec<Measurement> {
-    let mut out = vec![Measurement::of(input, None, None)];
+    let mut out = vec![Measurement::of(input, None, false, None)];
     for squeeze in squeezes(input) {
-        let Ok(squeezed) = squeeze::squeeze(input, &squeeze, None) else { continue };
-        for &alphabet in alphabets {
-            let folded = squeeze::render(squeeze.name(), &squeezed, alphabet, 100, false);
-            out.push(Measurement::of(folded.as_bytes(), Some(squeeze.clone()), Some(alphabet)));
+        let indexing: &[bool] = if squeeze.has_tables() { &[false, true] } else { &[false] };
+        for &index in indexing {
+            let Ok(squeezed) = squeeze::squeeze(input, &squeeze, None, index) else { continue };
+            let values: BTreeSet<String> = squeezed.tables.index_values().into_iter().collect();
+            let kept = (!values.is_empty())
+                .then(|| Index::new(values).expect("a set holds no value twice"));
+            for &alphabet in alphabets {
+                // What the caller keeps: the folded text, and the index beside it.
+                let mut folded =
+                    squeeze::render(squeeze.name(), &squeezed, alphabet, 100, false, kept.as_ref());
+                folded.extend(kept.as_ref().map(Index::to_text));
+                let squeeze = Some(squeeze.clone());
+                out.push(Measurement::of(folded.as_bytes(), squeeze, index, Some(alphabet)));
+            }
         }
     }
     out

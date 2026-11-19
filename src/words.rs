@@ -1,4 +1,5 @@
-//! Words from a fixed list, written as their places in it: the README's "words from a fixed list".
+//! Words from a fixed list, written as their places in it (docs/theory.md, "Words from a fixed
+//! list").
 //!
 //! Most spellings never occur (no weekday is spelled `xqzv`), so a word that can only be one of a
 //! known list costs only the bits the list's length needs, however long it is. A [`Record`] of
