@@ -35,6 +35,9 @@ whole file it is smaller, but an edit changes everything after it. See
 - **`deflate`**: deflate over the whole file, or a line at a time, each line compressed with the
   lines above it as deflate's preset dictionary.
 - **`zstd`**: Zstandard over the whole file.
+- **`auto`**: folds with `table` (where the lines are rows), `text`, `pack` and `deflate` leaning on
+  the line above, and keeps the smallest fold, its index included. It costs those four folds and
+  no more: the fold it keeps is the one it made, not folded again.
 
 ## Alphabets to fold into
 
@@ -193,6 +196,22 @@ The savings are estimates (a spelled character is guessed at 5 bits, a body bit 
 byte, as in base64), and a list is one more thing for whoever keeps the folded text to look after,
 so a list that only just pays isn't worth having. Indexing is off unless a fold asks for it, since
 a fold without an index is simpler to follow; on, it is usually much smaller.
+
+Estimates can be wrong both ways, and a fold can measure instead. Given a time limit
+(`--measure-up-to`), a fold whose estimates kept an index also folds without one. It keeps whichever
+comes out smaller, the index counted as the text it is kept as; a tie goes to the fold without, as
+the simpler. Both folds are complete when they are weighed, so the one kept is given back as it was
+made, not folded a third time. Measuring takes about as long again as the fold itself, so the limit
+caps it: past it, the second fold is given up where it stands, and the estimates' choice is kept.
+The measurement weighs the whole index against none; it doesn't try lists one by one.
+
+Weighing two folds means having both, but not both in memory. While the second is made, the first
+waits: in memory while it is small, and past 8 MiB in a temporary file. On Unix the file loses its
+name the moment it is opened, so it is gone with the fold, however that ends. `auto` weighs its
+folds the same way, the smallest so far waiting while the next is made. Folding files, the
+temporary file goes beside them, on their disk; otherwise into the system's temporary folder
+(`TMPDIR`). Where that folder is itself in memory (a tmpfs `/tmp`), the waiting fold leaves the
+fold's memory but not the machine's, and the file is better put on a disk.
 
 The index doesn't go into the folded text. It comes back beside it, for the caller to keep where it
 suits: inside a file format of its own, in a file beside the text, or once for many texts. Texts

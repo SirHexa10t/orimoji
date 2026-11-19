@@ -65,6 +65,13 @@ became of it: no index, because nothing paid for itself and the text unfolds alo
 keep. A text that needs an index says so in its first line, and won't unfold without it, or with
 another.
 
+Whether an index pays is estimated. To know instead, give the fold a time limit
+(`--measure-up-to 5s`): it also folds without the index, keeps whichever fold is smaller, index
+included, and says which. The fold kept is the one already made, not folded again. If measuring
+takes longer than the limit, it gives up and the estimates decide. While the second fold is made,
+the first waits in a temporary file once it is past 8 MiB, so the two are never in memory together.
+The file goes beside the output, or into `TMPDIR` for standard output.
+
 ## Using it
 
 ### The command line
@@ -80,9 +87,10 @@ another.
 
 | Option | Does |
 |---|---|
-| `-s`, `--squeeze` | `auto` (the default: the smallest line squeeze), `none`, `pack`, `text`, `table`, `deflate` or `zstd` |
+| `-s`, `--squeeze` | `auto` (the default: folds with `table`, `text`, `pack` and line-by-line `deflate`, and keeps the smallest), `none`, `pack`, `text`, `table`, `deflate` or `zstd` |
 | `-a`, `--alphabet` | any of the alphabets; `base64url` by default |
 | `--index FILE` | lets `table` and `text` index, and keeps the index in FILE, if one paid for itself; files folded together share it |
+| `--measure-up-to TIME` | measures, rather than estimates, whether the index pays, for TIME at most (`30ms`, `5s`, `15m`, `1h`, `2d`) |
 | `--in-place` | writes over the files instead of beside them |
 | `--suffix S` | the suffix of the files written beside them (`.folded`): a fold adds it, an unfold takes it off |
 | `-o`, `--output FILE` | writes there instead, for standard input or a single file (`-` for standard output) |
@@ -126,11 +134,14 @@ assert_eq!(orimoji::unfold(&next, index)?, newer);
 ```
 
 `orimoji::fold_all` folds several inputs into one shared index, and `orimoji::files` folds files in
-place or beside themselves (`Output::InPlace`, `Output::Suffix`). `Index::to_text` and
-`Index::from_text` keep an index as text, and `orimoji::needs_index` says whether a stored text
-needs one. `orimoji::pick` chooses the line squeeze the way `auto` does, `orimoji::measure`
-measures, `orimoji::words` writes words from a fixed list as numbers, and `Alphabet` folds bytes or
-bits by itself.
+place or beside themselves (`Output::InPlace`, `Output::Suffix`). `Squeeze::Auto` is `auto`, and
+every fold says which squeeze made it (`folded.squeeze`). `Fold::measured_up_to` measures whether the
+index pays, `Judged` says how it was decided, and `orimoji::time_limit` reads limits like `5s`.
+`Fold::buffer_past` and `Fold::buffer_folder` say when and where a fold waiting to be weighed goes
+to a temporary file. `Index::to_text` and `Index::from_text` keep an index as text, and
+`orimoji::needs_index` says whether a stored text needs one. `orimoji::measure` measures,
+`orimoji::words` writes words from a fixed list as numbers, and `Alphabet` folds bytes or bits by
+itself.
 
 ### Examples
 

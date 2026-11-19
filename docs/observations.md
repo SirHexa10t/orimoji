@@ -121,6 +121,43 @@ Counted with its index, the index halves the fold where values or escapes repeat
 repeats enough to pay twice over, as in the braille drawing, the fold says no index is needed and
 is as it was; where little does, as in the ASCII art, it can cost a point.
 
+## Measuring instead of estimating
+
+Folded with `--measure-up-to`, the long art finds what the estimates missed: its index costs more
+than it saves, so it is dropped, and the fold is back at 30%. On the listing, measuring confirms the
+index: 12,786,159 bytes indexed, index included, against 24,487,121 without. Measuring the listing
+takes 3.2 s against the plain fold's 1.6 s; given `--measure-up-to 100ms`, it gives up at its limit
+and the fold takes no longer than without measuring.
+
+## Memory
+
+The listing (31 MiB) folded onto standard output, at the fold's peak:
+
+| Fold of the listing | Time | Peak memory | With a buffer in tmpfs counted |
+|---|--:|--:|--:|
+| `none` | 0.1 s | 115 MiB | 119 MiB |
+| `pack` | 1.1 s | 218 MiB | 222 MiB |
+| `table --index` | 1.6 s | 177 MiB | 180 MiB |
+| `table --index --measure-up-to 1h` | 3.2 s | 186 MiB | 202 MiB |
+| the same, the indexed fold held in memory | 3.3 s | 205 MiB | 208 MiB |
+| `auto --index` | 5.4 s | 270 MiB | 286 MiB |
+| `auto --index --measure-up-to 1h` | 7.1 s | 270 MiB | 286 MiB |
+| the same, the folds held in memory | 7.2 s | 331 MiB | 334 MiB |
+
+At its peak a fold takes several times its input, most of it the squeeze's own work: the table
+squeeze's model of every column, pack's numbers. `auto` peaks where `pack` does, the wrong tool for
+the listing but still tried.
+
+Measuring, the indexed fold (12.5 MB) waits in a temporary file while the fold without the index is
+made, which keeps 19 MiB out of the fold's memory; through `auto`'s four folds and the measurement,
+61 MiB. Here the file was in a tmpfs `/tmp`, so the bytes stayed in the machine's memory (the last
+column): on a disk they leave it. The rows "held in memory" are the same build with nowhere to
+write the file (a `TMPDIR` that doesn't exist), which it falls back from.
+
+Two changes went with buffering. A fold used to hold its body twice at its end, as lines and as the
+folded text: `pack` peaked at 380 MiB and `none` at 243 MiB. And `auto` used to fold the squeeze it
+chose a second time: `auto --index` took 7.4 s and peaked at 413 MiB.
+
 ## One index for several files
 
 The three drawings folded together share one index (`cargo run --example shared_index`): 6,211
@@ -194,7 +231,8 @@ orimoji has deflate and zstd: brotli and xz came within a few percent of zstd 19
 ## Measured how
 
 On one core of a Ryzen 9 9950X3D. The alphabets folded and unfolded 1 MiB of random bytes, best of
-5. An indexed fold is measured with its index, kept as text. The listing is catalogames' local
+5. Peak memory is the fold's maximum resident set; with a buffer in tmpfs counted, the peak of its
+memory cgroup, which charges tmpfs pages to the fold that wrote them. An indexed fold is measured with its index, kept as text. The listing is catalogames' local
 `steam-games.tsv`, from its sweep of 2026-09-26. The drawings are arterminal's examples as
 arterminal saves them. The size in git is zlib at level 6, git's default for packs.
 `orimoji measure` made the result tables; the deflate rows under

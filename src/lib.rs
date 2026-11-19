@@ -4,7 +4,7 @@
 //! A fold is two steps:
 //!
 //! - a [`Squeeze`] makes the data smaller: packing, a Huffman code, a table's column models,
-//!   deflate or zstd, or nothing;
+//!   deflate or zstd, nothing, or whichever line squeeze is smallest ([`Squeeze::Auto`]);
 //! - an [`Alphabet`] writes what is left as characters: hex, base32, base58, base64, Z85, basE91,
 //!   base94, braille, two-byte letters, one-cell symbols or CJK.
 //!
@@ -80,7 +80,9 @@ pub mod squeeze;
 pub mod words;
 
 mod bignum;
+mod buffer;
 mod container;
+mod deadline;
 mod error;
 mod escape;
 
@@ -90,7 +92,11 @@ pub use files::Output;
 pub use index::{Index, Indexing};
 pub use squeeze::{Squeeze, TableOptions};
 
+use buffer::Buffered;
+use deadline::Deadline;
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// How to fold: a squeeze, an alphabet, and how the folded file is laid out.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,77 +116,240 @@ pub struct Fold {
     /// keep wherever it suits and to give back to [`unfold`]. Off by default, since a fold without
     /// an index is simpler to follow; on, it is usually smaller.
     pub index: bool,
+    /// Whether to measure, not estimate, whether the index pays, and for how long at most: when
+    /// the estimates keep an index, fold without it too, and keep whichever fold is smaller, the
+    /// index counted as its text. The fold kept is the one given back, never made again. The fold
+    /// without the index may take this long at most; past it, it is given up and the estimates
+    /// decide. [`Judged`] says which happened. `None`, the default, measures nothing.
+    pub measure_up_to: Option<Duration>,
+    /// The size past which a fold waiting to be weighed against another (the estimates' fold
+    /// while the fold without the index is made, or the smallest of [`Squeeze::Auto`]'s so far)
+    /// is buffered in a temporary file instead of held in memory, so that the two are never in
+    /// memory together. [`BUFFER_PAST`] by default.
+    pub buffer_past: usize,
+    /// Where those temporary files go. `None`, the default, is the system's temporary folder
+    /// ([`std::env::temp_dir`], which `TMPDIR` sets), or, folding files, the folder the first of
+    /// them is written to. A temporary file is gone once it isn't needed; on Unix it has no name
+    /// from the moment it is opened, so not even a killed fold leaves one behind.
+    pub buffer_folder: Option<PathBuf>,
 }
+
+/// [`Fold::buffer_past`] unless set otherwise: 8 MiB.
+pub const BUFFER_PAST: usize = 8 << 20;
 
 impl Fold {
     pub fn new(squeeze: Squeeze, alphabet: Alphabet) -> Self {
-        Self { squeeze, alphabet, wrap: 100, readable: false, index: false }
+        Self {
+            squeeze,
+            alphabet,
+            wrap: 100,
+            readable: false,
+            index: false,
+            measure_up_to: None,
+            buffer_past: BUFFER_PAST,
+            buffer_folder: None,
+        }
     }
 
     /// The same fold, allowed to index.
     pub fn indexed(self) -> Self {
         Self { index: true, ..self }
     }
+
+    /// The same fold, measuring whether its index pays, for `limit` at most.
+    pub fn measured_up_to(self, limit: Duration) -> Self {
+        Self { measure_up_to: Some(limit), ..self }
+    }
 }
 
-/// A fold: the folded text, and the index to keep beside it, if any.
+/// How a fold decided whether its index pays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Judged {
+    /// By the estimates: the fold wasn't asked to measure, or had nothing to measure, as when it
+    /// wasn't asked to index or no list was worth keeping.
+    Estimated,
+    /// By measuring: the bytes it takes indexed, the index's text included, and unindexed. The
+    /// smaller was kept, the unindexed one on a tie.
+    Measured { indexed: usize, unindexed: usize },
+    /// The measurement didn't finish in the time it was given, so the estimates decided.
+    OutOfTime,
+}
+
+/// A fold: the folded text, the index to keep beside it, if any, how the index was decided, and
+/// the squeeze it was folded with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Folded {
     pub text: String,
     pub indexing: Indexing,
+    pub judged: Judged,
+    /// The squeeze asked for, or the one [`Squeeze::Auto`] chose.
+    pub squeeze: Squeeze,
 }
 
-/// Inputs folded together: their folded texts, in their order, and the one index they share.
+/// Inputs folded together: their folded texts, in their order, the one index they share, how it
+/// was decided, and the squeeze they were folded with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoldedAll {
     pub texts: Vec<String>,
     pub indexing: Indexing,
+    pub judged: Judged,
+    /// The squeeze asked for, or the one [`Squeeze::Auto`] chose.
+    pub squeeze: Squeeze,
 }
 
 /// `input`, folded.
 pub fn fold(input: &[u8], how: &Fold) -> Result<Folded, FoldError> {
-    let FoldedAll { mut texts, indexing } = fold_all(&[input], how)?;
-    Ok(Folded { text: texts.remove(0), indexing })
+    let FoldedAll { mut texts, indexing, judged, squeeze } = fold_all(&[input], how)?;
+    Ok(Folded { text: texts.remove(0), indexing, judged, squeeze })
 }
 
 /// `inputs`, each folded on its own but into one shared index, kept once for them all: every
 /// value any of them lists, sorted. Each input still decides by itself what is worth listing, and
-/// one that lists nothing doesn't need the index at all.
+/// one that lists nothing doesn't need the index at all. [`Squeeze::Auto`] chooses one squeeze for
+/// them all, the one that folds them smallest together.
 pub fn fold_all(inputs: &[&[u8]], how: &Fold) -> Result<FoldedAll, FoldError> {
-    fold_each(inputs, how).map_err(|(_, error)| error)
+    let folder = how.buffer_folder.clone().unwrap_or_else(std::env::temp_dir);
+    fold_each(inputs, how, &folder).map_err(|(_, error)| error)
 }
 
-/// [`fold_all`], saying which input a fold failed on.
-pub(crate) fn fold_each(inputs: &[&[u8]], how: &Fold) -> Result<FoldedAll, (usize, FoldError)> {
+/// A fold made: its squeeze, its texts, its indexing, and the bytes it costs the caller, its
+/// index's text included.
+struct Made {
+    squeeze: Squeeze,
+    texts: Buffered,
+    indexing: Indexing,
+    size: usize,
+}
+
+/// [`fold_all`], buffering in `folder`, and saying which input a fold failed on, if it failed on
+/// one rather than on its buffer.
+pub(crate) fn fold_each(
+    inputs: &[&[u8]],
+    how: &Fold,
+    folder: &Path,
+) -> Result<FoldedAll, (Option<usize>, FoldError)> {
+    let on_input = |(at, error)| (Some(at), error);
+    // The estimates' fold: with the squeeze asked for, or the smallest of auto's. Each fold is
+    // weighed as it is made, and only the smallest so far is kept, buffered while the next is made.
+    let (mut smallest, mut failed): (Option<Made>, _) = (None, None);
+    for squeeze in how.squeeze.candidates() {
+        if let Some(waiting) = &mut smallest {
+            waiting.texts.buffer(how.buffer_past, folder);
+        }
+        match fold_unmeasured(inputs, &squeeze, how, how.index, Deadline::NONE) {
+            Ok(made) if smallest.as_ref().is_none_or(|smallest| made.size < smallest.size) => {
+                smallest = Some(made);
+            }
+            Ok(_) => {}
+            // A squeeze that doesn't take these inputs: auto goes on to the others, and a squeeze
+            // asked for alone fails the fold with this.
+            Err(error) => {
+                failed.get_or_insert(error);
+            }
+        }
+    }
+    let Some(Made { squeeze, mut texts, indexing, size }) = smallest else {
+        return Err(on_input(failed.expect("a squeeze was tried")));
+    };
+    // The measurement: the same squeeze without the index, while the estimates' fold waits.
+    let judged = match (how.measure_up_to, &indexing) {
+        (Some(limit), Indexing::Index(_)) => {
+            let deadline = Deadline::after(limit);
+            texts.buffer(how.buffer_past, folder);
+            match fold_unmeasured(inputs, &squeeze, how, false, deadline) {
+                Ok(plain) if plain.size <= size => {
+                    let judged = Judged::Measured { indexed: size, unindexed: plain.size };
+                    drop(texts);
+                    let texts =
+                        plain.texts.take().map_err(|error| (None, FoldError::Buffer(error)))?;
+                    return Ok(FoldedAll { texts, indexing: Indexing::Unneeded, judged, squeeze });
+                }
+                Ok(plain) => Judged::Measured { indexed: size, unindexed: plain.size },
+                Err((_, FoldError::OutOfTime)) => Judged::OutOfTime,
+                Err(error) => return Err(on_input(error)),
+            }
+        }
+        _ => Judged::Estimated,
+    };
+    let texts = texts.take().map_err(|error| (None, FoldError::Buffer(error)))?;
+    Ok(FoldedAll { texts, indexing, judged, squeeze })
+}
+
+/// `inputs`, folded with `squeeze`, indexing or not as `index` says, by the estimates alone, and
+/// given up past `deadline`.
+fn fold_unmeasured(
+    inputs: &[&[u8]],
+    squeeze: &Squeeze,
+    how: &Fold,
+    index: bool,
+    deadline: Deadline,
+) -> Result<Made, (usize, FoldError)> {
     let squeezed: Vec<squeeze::Squeezed> = inputs
         .iter()
         .enumerate()
         .map(|(at, input)| {
-            squeeze::squeeze(input, &how.squeeze, None, how.index).map_err(|error| (at, error))
+            squeeze::squeeze(input, squeeze, None, index, deadline).map_err(|error| (at, error))
         })
         .collect::<Result<_, _>>()?;
     let values: BTreeSet<String> =
         squeezed.iter().flat_map(|squeezed| squeezed.tables.index_values()).collect();
-    let indexing = match (how.index, values.is_empty()) {
+    let indexing = match (index, values.is_empty()) {
         (false, _) => Indexing::Off,
         (true, true) => Indexing::Unneeded,
         (true, false) => Indexing::Index(Index::new(values).expect("a set holds no value twice")),
     };
     let texts = squeezed
-        .iter()
-        .map(|squeezed| {
-            let name = how.squeeze.name();
-            squeeze::render(name, squeezed, how.alphabet, how.wrap, how.readable, indexing.index())
+        .into_iter()
+        .enumerate()
+        .map(|(at, squeezed)| {
+            let (name, alphabet, index) = (squeeze.name(), how.alphabet, indexing.index());
+            squeeze::render_within(
+                name,
+                &squeezed,
+                alphabet,
+                how.wrap,
+                how.readable,
+                index,
+                deadline,
+            )
+            .map_err(|error| (at, error))
         })
-        .collect();
-    Ok(FoldedAll { texts, indexing })
+        .collect::<Result<_, _>>()?;
+    let texts = Buffered::new(texts);
+    let size = texts.size() + indexing.index().map_or(0, |index| index.to_text().len());
+    Ok(Made { squeeze: squeeze.clone(), texts, indexing, size })
+}
+
+/// A time limit as people write it: a number, then `ms`, `s`, `m`, `h` or `d`, as in `30ms`, `5s`,
+/// `1.5h` or `2d`.
+pub fn time_limit(text: &str) -> Result<Duration, String> {
+    let text = text.trim();
+    let split = text.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let seconds_each = match unit {
+        "ms" => 0.001,
+        "s" => 1.0,
+        "m" => 60.0,
+        "h" => 3600.0,
+        "d" => 86_400.0,
+        _ => {
+            return Err(format!(
+                "`{text}` is no time: a number, then ms, s, m, h or d, as in 30ms or 5s"
+            ));
+        }
+    };
+    let number: f64 =
+        number.parse().map_err(|_| format!("`{text}` has no number before its unit"))?;
+    Duration::try_from_secs_f64(number * seconds_each)
+        .map_err(|_| format!("`{text}` is no time this can wait"))
 }
 
 /// `input`, folded with the tables of `previous`, an earlier fold of an earlier version of it, and
 /// with `index`, the index that fold needs, if any. Every line the two have in common folds to the
 /// same body line, and the index stays as it was: what the old tables and index don't hold is
 /// spelled out instead, a little larger. Fold afresh now and then to bring them up to date. The
-/// squeeze must be the one `previous` was folded with; the alphabet may differ.
+/// squeeze must be the one `previous` was folded with, or [`Squeeze::Auto`], which takes that
+/// one; the alphabet may differ.
 pub fn fold_keeping(
     input: &[u8],
     previous: &str,
@@ -188,12 +357,17 @@ pub fn fold_keeping(
     how: &Fold,
 ) -> Result<String, FoldError> {
     let folded = container::parse(previous).map_err(FoldError::Previous)?;
-    if folded.header.squeeze != how.squeeze.name() {
-        return Err(FoldError::PreviousSqueeze(folded.header.squeeze));
-    }
+    let squeeze = match &how.squeeze {
+        Squeeze::Auto(table) => {
+            Squeeze::named_in(&folded.header, table).map_err(FoldError::Previous)?
+        }
+        squeeze if squeeze.name() == folded.header.squeeze => squeeze.clone(),
+        _ => return Err(FoldError::PreviousSqueeze(folded.header.squeeze)),
+    };
     let its_index = squeeze::needed(&folded, index).map_err(FoldError::Previous)?;
-    let squeezed = squeeze::squeeze(input, &how.squeeze, Some((&folded, its_index)), how.index)?;
-    let name = how.squeeze.name();
+    let kept = Some((&folded, its_index));
+    let squeezed = squeeze::squeeze(input, &squeeze, kept, how.index, Deadline::NONE)?;
+    let name = squeeze.name();
     Ok(squeeze::render(name, &squeezed, how.alphabet, how.wrap, how.readable, its_index))
 }
 
@@ -213,27 +387,4 @@ pub fn needs_index(folded: &str) -> Result<bool, UnfoldError> {
 pub fn folded_with(folded: &str) -> Result<(String, Alphabet), UnfoldError> {
     let header = container::header_of(folded)?;
     Ok((header.squeeze, header.alphabet))
-}
-
-/// The line squeeze that folds `input` smallest into `alphabet`, index included, indexing or not:
-/// of a table (where its lines are rows), text, pack and deflate leaning on the line above. Each
-/// is tried, so this takes as long as the four folds.
-pub fn pick(input: &[u8], alphabet: Alphabet, index: bool) -> Squeeze {
-    let candidates = [
-        Squeeze::Table(TableOptions::default()),
-        Squeeze::Text,
-        Squeeze::Pack,
-        Squeeze::Deflate { lean: Some(1) },
-    ];
-    candidates
-        .into_iter()
-        .filter_map(|squeeze| {
-            let how = Fold { index, ..Fold::new(squeeze.clone(), alphabet) };
-            let folded = fold(input, &how).ok()?;
-            let size = folded.text.len()
-                + folded.indexing.index().map_or(0, |index| index.to_text().len());
-            Some((size, squeeze))
-        })
-        .min_by_key(|(size, _)| *size)
-        .map_or(Squeeze::None { whole: false }, |(_, squeeze)| squeeze)
 }

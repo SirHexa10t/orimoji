@@ -18,6 +18,7 @@
 use super::{Body, Kept, Line, Squeezed, Tables};
 use crate::bits::{BitReader, BitWriter};
 use crate::container::{self, Folded, Line as FileLine};
+use crate::deadline::Deadline;
 use crate::error::{FoldError, UnfoldError};
 use crate::escape::escape;
 use crate::huffman::{self, Decoder, Encoder};
@@ -58,7 +59,21 @@ enum Event<'a> {
 impl TextCode {
     /// The code that spells `strings` in the fewest bits; with `index`, words and escapes that pay
     /// for themselves twice over are single symbols.
+    #[cfg(test)]
     pub(crate) fn learn<'a, I>(strings: I, index: bool) -> Self
+    where
+        I: IntoIterator<Item = &'a str>,
+        I::IntoIter: Clone,
+    {
+        Self::learn_within(strings, index, Deadline::NONE).expect("no deadline to pass")
+    }
+
+    /// [`TextCode::learn`], giving up past `deadline`.
+    pub(crate) fn learn_within<'a, I>(
+        strings: I,
+        index: bool,
+        deadline: Deadline,
+    ) -> Result<Self, FoldError>
     where
         I: IntoIterator<Item = &'a str>,
         I::IntoIter: Clone,
@@ -66,7 +81,8 @@ impl TextCode {
         let strings = strings.into_iter();
         let mut tokens: HashMap<&str, u64> = HashMap::new();
         if index {
-            for string in strings.clone() {
+            for (at, string) in strings.clone().enumerate() {
+                deadline.check_at(at)?;
                 let words =
                     string.split(|c: char| !wordy(c)).filter(|word| word.chars().nth(1).is_some());
                 for token in csi_tokens(string).chain(words) {
@@ -80,7 +96,8 @@ impl TextCode {
             .map(|(token, _)| token)
             .collect();
         let (mut counts, mut ends, mut runs) = (HashMap::<&str, u64>::new(), 0u64, 0u64);
-        for string in strings {
+        for (at, string) in strings.enumerate() {
+            deadline.check_at(at)?;
             for event in events(&units(string, |token| known.contains(token))) {
                 match event {
                     Event::Unit(unit) => *counts.entry(unit).or_default() += 1,
@@ -98,7 +115,8 @@ impl TextCode {
             symbols.push(Symbol::Text(text.to_string()));
             weights.push(count);
         }
-        Self::new(symbols, huffman::lengths(&weights)).expect("Huffman lengths make a prefix code")
+        Ok(Self::new(symbols, huffman::lengths(&weights))
+            .expect("Huffman lengths make a prefix code"))
     }
 
     fn new(symbols: Vec<Symbol>, lengths: Vec<u32>) -> Option<Self> {
@@ -312,25 +330,30 @@ pub(crate) fn squeeze(
     text: &str,
     kept: Option<Kept<'_>>,
     index: bool,
+    deadline: Deadline,
 ) -> Result<Squeezed, FoldError> {
     let lines: Vec<&str> = text.split('\n').collect();
     let code = match kept {
         Some((previous, its_index)) => {
             read_code(previous, its_index).map_err(FoldError::Previous)?
         }
-        None => TextCode::learn(lines.iter().copied().filter(|line| !line.is_empty()), index),
+        None => {
+            let strings = lines.iter().copied().filter(|line| !line.is_empty());
+            TextCode::learn_within(strings, index, deadline)?
+        }
     };
-    let body = lines
-        .iter()
-        .map(|line| match line.is_empty() {
+    let mut body = Vec::with_capacity(lines.len());
+    for (at, line) in lines.iter().enumerate() {
+        deadline.check_at(at)?;
+        body.push(match line.is_empty() {
             true => Line::Empty,
             false => {
                 let mut writer = BitWriter::new();
                 code.write(&mut writer, line);
                 Line::Bits(writer.finish())
             }
-        })
-        .collect();
+        });
+    }
     Ok(Squeezed { options: Vec::new(), tables: Tables::Text(code), body: Body::Lines(body) })
 }
 

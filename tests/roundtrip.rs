@@ -2,7 +2,7 @@
 //! inputs most likely to break a line-based format.
 
 use orimoji::{
-    Alphabet, Fold, FoldError, Folded, Index, Indexing, Squeeze, TableOptions, UnfoldError,
+    Alphabet, Fold, FoldError, Folded, Index, Indexing, Judged, Squeeze, TableOptions, UnfoldError,
 };
 
 fn example(name: &str) -> Vec<u8> {
@@ -153,8 +153,9 @@ fn kept(folded: &Folded) -> usize {
 #[test]
 fn the_listing_is_folded_as_a_table_and_smaller_than_by_any_other_line_squeeze() {
     let listing = example("steam-games-excerpt.tsv");
+    let auto = Fold::new(Squeeze::Auto(TableOptions::default()), Alphabet::Base64Url).indexed();
     assert_eq!(
-        orimoji::pick(&listing, Alphabet::Base64Url, true),
+        orimoji::fold(&listing, &auto).unwrap().squeeze,
         Squeeze::Table(TableOptions::default())
     );
     let size = |squeeze: Squeeze| {
@@ -180,6 +181,34 @@ fn the_listing_is_folded_as_a_table_and_smaller_than_by_any_other_line_squeeze()
 }
 
 #[test]
+fn auto_gives_back_the_fold_of_the_squeeze_it_chose() {
+    for (name, index) in [
+        ("steam-games-excerpt.tsv", true),
+        ("long_ascii_anime_postergirl.txt", false),
+        ("small_filled_blocks_miku.txt", true),
+    ] {
+        let input = example(name);
+        let auto = Fold {
+            index,
+            ..Fold::new(Squeeze::Auto(TableOptions::default()), Alphabet::Base64Url)
+        };
+        let folded = orimoji::fold(&input, &auto).unwrap();
+        assert!(!matches!(folded.squeeze, Squeeze::Auto(_)), "{name}: auto names its choice");
+        let chosen = Fold { squeeze: folded.squeeze.clone(), ..auto.clone() };
+        assert_eq!(folded, orimoji::fold(&input, &chosen).unwrap(), "{name}: the fold it made");
+        let header = format!("=== orimoji 1 {} base64url", folded.squeeze.name());
+        assert!(folded.text.starts_with(&header), "{name}");
+        assert_eq!(orimoji::unfold(&folded.text, folded.indexing.index()).unwrap(), input);
+    }
+    // Bytes that are no text leave auto deflate, the one of its squeezes that takes bytes.
+    let bytes: Vec<u8> = (0..5000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let auto = Fold::new(Squeeze::Auto(TableOptions::default()), Alphabet::Base64Url);
+    let folded = orimoji::fold(&bytes, &auto).unwrap();
+    assert_eq!(folded.squeeze, Squeeze::Deflate { lean: Some(1) });
+    assert_eq!(orimoji::unfold(&folded.text, None).unwrap(), bytes);
+}
+
+#[test]
 fn a_fold_keeping_the_tables_changes_only_the_lines_that_changed() {
     let listing = String::from_utf8(example("steam-games-excerpt.tsv")).unwrap();
     let mut rows: Vec<String> = listing.lines().map(str::to_string).collect();
@@ -193,6 +222,10 @@ fn a_fold_keeping_the_tables_changes_only_the_lines_that_changed() {
         let index = before.indexing.index();
         let after = orimoji::fold_keeping(changed.as_bytes(), &before.text, index, &how).unwrap();
         assert_eq!(orimoji::unfold(&after, index).unwrap(), changed.as_bytes());
+        // Auto keeps the squeeze the earlier fold was made with.
+        let auto = Fold { squeeze: Squeeze::Auto(TableOptions::default()), ..how.clone() };
+        let kept = orimoji::fold_keeping(changed.as_bytes(), &before.text, index, &auto).unwrap();
+        assert_eq!(kept, after);
         let (old, new): (Vec<&str>, Vec<&str>) =
             (before.text.lines().collect(), after.lines().collect());
         let differing = old.iter().zip(&new).filter(|(a, b)| a != b).count();
@@ -289,7 +322,7 @@ fn a_damaged_folded_file_is_refused_or_read_but_never_panics() {
     let listing = example("steam-games-excerpt.tsv");
     for squeeze in squeezes() {
         let how = Fold::new(squeeze, Alphabet::Base64Url).indexed();
-        let Ok(Folded { text: folded, indexing }) = orimoji::fold(&listing, &how) else {
+        let Ok(Folded { text: folded, indexing, .. }) = orimoji::fold(&listing, &how) else {
             continue;
         };
         let index = indexing.index();
@@ -320,4 +353,104 @@ fn a_damaged_body_line_is_reported_with_its_line_number() {
         Err(UnfoldError::Alphabet { line, .. }) => assert_eq!(line, last + 1),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn time_limits_read_as_people_write_them() {
+    use std::time::Duration;
+    for (text, expected) in [
+        ("30ms", Duration::from_millis(30)),
+        ("5s", Duration::from_secs(5)),
+        ("15m", Duration::from_secs(900)),
+        ("1h", Duration::from_secs(3600)),
+        ("2d", Duration::from_secs(172_800)),
+        ("1.5s", Duration::from_millis(1500)),
+        (" 0ms ", Duration::ZERO),
+    ] {
+        assert_eq!(orimoji::time_limit(text), Ok(expected), "{text}");
+    }
+    for text in ["5", "s", "5x", "-1s", "", "1e3s", "5 s"] {
+        assert!(orimoji::time_limit(text).is_err(), "{text:?}");
+    }
+}
+
+#[test]
+fn a_measured_fold_keeps_whichever_way_is_smaller() {
+    let hour = std::time::Duration::from_secs(3600);
+    // On the ASCII art, the few words the estimates list cost more than they save.
+    let art = example("long_ascii_anime_postergirl.txt");
+    let how = Fold::new(Squeeze::Text, Alphabet::Base64Url).indexed();
+    assert!(orimoji::fold(&art, &how).unwrap().indexing.index().is_some(), "the estimates index");
+    let measured = orimoji::fold(&art, &how.clone().measured_up_to(hour)).unwrap();
+    let Judged::Measured { indexed, unindexed } = measured.judged else {
+        panic!("{:?}", measured.judged)
+    };
+    assert!(unindexed <= indexed && measured.indexing == Indexing::Unneeded);
+    assert_eq!(measured.text.len(), unindexed, "the unindexed fold is the one kept");
+    assert_eq!(orimoji::unfold(&measured.text, None).unwrap(), art);
+    // On the listing, the index pays, and stays.
+    let listing = example("steam-games-excerpt.tsv");
+    let how = Fold::new(Squeeze::Table(TableOptions::default()), Alphabet::Base64Url)
+        .indexed()
+        .measured_up_to(hour);
+    let measured = orimoji::fold(&listing, &how).unwrap();
+    let Judged::Measured { indexed, unindexed } = measured.judged else {
+        panic!("{:?}", measured.judged)
+    };
+    assert!(indexed < unindexed && measured.indexing.index().is_some());
+    assert_eq!(orimoji::unfold(&measured.text, measured.indexing.index()).unwrap(), listing);
+}
+
+#[test]
+fn a_measurement_out_of_time_leaves_the_estimates_deciding() {
+    let listing = example("steam-games-excerpt.tsv");
+    let how = Fold::new(Squeeze::Table(TableOptions::default()), Alphabet::Base64Url).indexed();
+    let estimated = orimoji::fold(&listing, &how).unwrap();
+    let rushed = orimoji::fold(&listing, &how.measured_up_to(std::time::Duration::ZERO)).unwrap();
+    assert_eq!(rushed.judged, Judged::OutOfTime);
+    assert_eq!((&rushed.text, &rushed.indexing), (&estimated.text, &estimated.indexing));
+    assert_eq!(estimated.judged, Judged::Estimated);
+}
+
+#[test]
+fn with_no_index_to_weigh_there_is_nothing_to_measure() {
+    let hour = std::time::Duration::from_secs(3600);
+    let drawing = example("small_braille_kirino.txt");
+    let unindexed = Fold::new(Squeeze::Text, Alphabet::Base64Url).measured_up_to(hour);
+    assert_eq!(orimoji::fold(&drawing, &unindexed).unwrap().judged, Judged::Estimated);
+    let unneeded = orimoji::fold(&drawing, &unindexed.indexed()).unwrap();
+    assert_eq!((unneeded.indexing, unneeded.judged), (Indexing::Unneeded, Judged::Estimated));
+}
+
+/// A folder of the test's own, empty.
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("orimoji-roundtrip-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a temporary folder");
+    dir
+}
+
+#[test]
+fn a_fold_buffered_while_another_is_made_is_given_back_as_it_was() {
+    let hour = std::time::Duration::from_secs(3600);
+    let dir = scratch("buffered");
+    for (name, squeeze) in [
+        // The fold without the index wins, and the buffered one is dropped unread.
+        ("long_ascii_anime_postergirl.txt", Squeeze::Text),
+        // The indexed fold wins, and is read back.
+        ("steam-games-excerpt.tsv", Squeeze::Table(TableOptions::default())),
+        // Auto's smallest so far waits through the others, then through the measurement.
+        ("steam-games-excerpt.tsv", Squeeze::Auto(TableOptions::default())),
+        ("small_filled_blocks_miku.txt", Squeeze::Auto(TableOptions::default())),
+    ] {
+        let input = example(name);
+        let how = Fold::new(squeeze, Alphabet::Base64Url).indexed().measured_up_to(hour);
+        let held = Fold { buffer_past: usize::MAX, ..how.clone() };
+        let buffered = Fold { buffer_past: 0, buffer_folder: Some(dir.clone()), ..how };
+        let folded = orimoji::fold(&input, &buffered).unwrap();
+        assert!(matches!(folded.judged, Judged::Measured { .. }), "{name}: {:?}", folded.judged);
+        assert_eq!(folded, orimoji::fold(&input, &held).unwrap(), "{name}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "{name}: nothing left behind");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }

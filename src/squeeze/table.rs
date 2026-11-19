@@ -25,6 +25,7 @@ use super::text::TextCode;
 use super::{Body, Kept, Line, Squeezed, Tables};
 use crate::bits::{BitReader, BitWriter};
 use crate::container::{self, Folded, Line as FileLine};
+use crate::deadline::Deadline;
 use crate::error::{FoldError, UnfoldError};
 use crate::escape::{escape, unescape};
 use crate::huffman::{self, Decoder, Encoder};
@@ -356,7 +357,13 @@ impl Costed {
 
 /// The cheapest model for these cells, in row order. With `index`, a model may list the column's
 /// common values, as long as the list takes at most half the space it saves.
+#[cfg(test)]
 fn plan(cells: &[&str], index: bool) -> Plan {
+    plan_within(cells, index, Deadline::NONE).expect("no deadline to pass")
+}
+
+/// [`plan`], giving up past `deadline`.
+fn plan_within(cells: &[&str], index: bool, deadline: Deadline) -> Result<Plan, FoldError> {
     let mut lists = vec![None];
     lists.extend(
         [',', ';'].into_iter().filter(|&s| cells.iter().any(|cell| cell.contains(s))).map(Some),
@@ -381,6 +388,7 @@ fn plan(cells: &[&str], index: bool) -> Plan {
             false => &[Kind::Spell][..],
         };
         for &kind in kinds {
+            deadline.check()?;
             let plain = evaluate(cells, list, kind, Vec::new());
             if index {
                 let dictionary = listable(&counts, total, kind);
@@ -394,7 +402,7 @@ fn plan(cells: &[&str], index: bool) -> Plan {
             consider(plain);
         }
     }
-    best.expect("there is always the plain model").plan
+    Ok(best.expect("there is always the plain model").plan)
 }
 
 /// The units worth listing: those that save at least twice the space their table line takes.
@@ -519,7 +527,12 @@ impl Table {
         row(line, self.separator, self.keep.as_deref(), self.columns.len())
     }
 
-    fn learn(lines: &[&str], options: &TableOptions, index: bool) -> Result<Self, FoldError> {
+    fn learn(
+        lines: &[&str],
+        options: &TableOptions,
+        index: bool,
+        deadline: Deadline,
+    ) -> Result<Self, FoldError> {
         let keep = options.keep.as_deref();
         let mut widths: HashMap<usize, usize> = HashMap::new();
         for line in lines
@@ -536,8 +549,11 @@ impl Table {
         let rows: Vec<Vec<&str>> =
             lines.iter().filter_map(|line| row(line, options.separator, keep, width)).collect();
         let columns: Vec<Column> = (0..width)
-            .map(|at| build(plan(&rows.iter().map(|row| row[at]).collect::<Vec<_>>(), index)))
-            .collect();
+            .map(|at| {
+                let cells: Vec<&str> = rows.iter().map(|row| row[at]).collect();
+                plan_within(&cells, index, deadline).map(build)
+            })
+            .collect::<Result<_, _>>()?;
         let mut spelled = Vec::new();
         let mut above = vec![0u64; width];
         for row in &rows {
@@ -545,28 +561,30 @@ impl Table {
                 columns[at].spelled(cell, &mut above[at], &mut spelled);
             }
         }
-        let spell = TextCode::learn(spelled.iter().copied(), index);
+        let spell = TextCode::learn_within(spelled.iter().copied(), index, deadline)?;
         Ok(Self { separator: options.separator, keep: options.keep.clone(), columns, spell })
     }
 
-    fn encode(&self, lines: &[&str]) -> Vec<Line> {
+    fn encode(&self, lines: &[&str], deadline: Deadline) -> Result<Vec<Line>, FoldError> {
         let mut above = vec![0u64; self.columns.len()];
-        lines
-            .iter()
-            .map(|line| {
-                if line.is_empty() {
-                    return Line::Empty;
-                }
-                let Some(cells) = self.row(line) else {
-                    return Line::Kept(escape(line));
-                };
-                let mut writer = BitWriter::new();
-                for (at, cell) in cells.iter().enumerate() {
-                    self.columns[at].write_cell(&mut writer, cell, &mut above[at], &self.spell);
-                }
-                Line::Bits(writer.finish())
-            })
-            .collect()
+        let mut body = Vec::with_capacity(lines.len());
+        for (at, line) in lines.iter().enumerate() {
+            deadline.check_at(at)?;
+            if line.is_empty() {
+                body.push(Line::Empty);
+                continue;
+            }
+            let Some(cells) = self.row(line) else {
+                body.push(Line::Kept(escape(line)));
+                continue;
+            };
+            let mut writer = BitWriter::new();
+            for (column, cell) in cells.iter().enumerate() {
+                self.columns[column].write_cell(&mut writer, cell, &mut above[column], &self.spell);
+            }
+            body.push(Line::Bits(writer.finish()));
+        }
+        Ok(body)
     }
 
     /// The values its lists and spelling put in an index.
@@ -771,15 +789,16 @@ pub(crate) fn squeeze(
     options: &TableOptions,
     kept: Option<Kept<'_>>,
     index: bool,
+    deadline: Deadline,
 ) -> Result<Squeezed, FoldError> {
     let lines: Vec<&str> = text.split('\n').collect();
     let table = match kept {
         Some((previous, its_index)) => {
             Table::read(previous, its_index).map_err(FoldError::Previous)?
         }
-        None => Table::learn(&lines, options, index)?,
+        None => Table::learn(&lines, options, index, deadline)?,
     };
-    let body = Body::Lines(table.encode(&lines));
+    let body = Body::Lines(table.encode(&lines, deadline)?);
     Ok(Squeezed { options: Vec::new(), tables: Tables::Table(table), body })
 }
 

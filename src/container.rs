@@ -148,14 +148,25 @@ fn header(line: &str) -> Result<Header, UnfoldError> {
     })
 }
 
-/// The whole file, from its parts.
-pub(crate) fn assemble(header: &Header, tables: &[String], body: &[String]) -> String {
-    let size = tables.iter().chain(body).map(|line| line.len() + 1).sum::<usize>() + 80;
+/// The file up to its `=== body ===` line: each body line then follows as `\n` and the line, and
+/// the file ends in a last `\n`. Written that way, a body is never held twice, as its lines and
+/// as the file.
+pub(crate) fn head(header: &Header, tables: &[String]) -> String {
+    let size = tables.iter().map(|line| line.len() + 1).sum::<usize>() + 80;
     let mut out = String::with_capacity(size);
     out.push_str(&header.line());
-    for line in
-        tables.iter().map(String::as_str).chain([BODY]).chain(body.iter().map(String::as_str))
-    {
+    for line in tables.iter().map(String::as_str).chain([BODY]) {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
+}
+
+/// The whole file, from its parts.
+#[cfg(test)]
+pub(crate) fn assemble(header: &Header, tables: &[String], body: &[String]) -> String {
+    let mut out = head(header, tables);
+    for line in body {
         out.push('\n');
         out.push_str(line);
     }

@@ -3,7 +3,9 @@
 //! Every file is folded (or unfolded) before any is written, so a file that fails leaves all of
 //! them as they were. Each is then written whole to a temporary file beside it and renamed into
 //! place, keeping the permissions of a file it replaces. Files folded together share one index,
-//! which comes back to the caller like any fold's.
+//! which comes back to the caller like any fold's. A fold waiting to be weighed against another
+//! (see [`Fold::buffer_past`]) is buffered beside the files too, unless [`Fold::buffer_folder`]
+//! says where.
 //!
 //! ```no_run
 //! use orimoji::files::{self, Output};
@@ -16,7 +18,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::{Fold, FoldError, Index, Indexing, UnfoldError};
+use crate::{Fold, FoldError, Index, Indexing, Judged, Squeeze, UnfoldError};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -40,11 +42,15 @@ impl Default for Output {
     }
 }
 
-/// Files folded together: where each was written, in their order, and the index they share.
+/// Files folded together: where each was written, in their order, the index they share, how it
+/// was decided, and the squeeze they were folded with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoldedFiles {
     pub written: Vec<PathBuf>,
     pub indexing: Indexing,
+    pub judged: Judged,
+    /// The squeeze asked for, or the one [`Squeeze::Auto`] chose.
+    pub squeeze: Squeeze,
 }
 
 /// Why files couldn't be folded or unfolded.
@@ -98,16 +104,38 @@ pub fn fold_files<P: AsRef<Path>>(
     let inputs: Vec<Vec<u8>> =
         paths.iter().map(|path| read(path.as_ref())).collect::<Result<_, _>>()?;
     let refs: Vec<&[u8]> = inputs.iter().map(Vec::as_slice).collect();
-    let folded = crate::fold_each(&refs, how).map_err(|(at, error)| FilesError::Fold {
-        path: paths[at].as_ref().to_path_buf(),
-        error,
-    })?;
     let written: Vec<PathBuf> =
         paths.iter().map(|path| folded_name(path.as_ref(), output)).collect();
-    for (target, text) in written.iter().zip(&folded.texts) {
+    // On the disk the folds go to, which a system's temporary folder may not be.
+    let folder = match (&how.buffer_folder, written.first()) {
+        (Some(folder), _) => folder.clone(),
+        (None, Some(first)) => folder_of(first).to_path_buf(),
+        (None, None) => std::env::temp_dir(),
+    };
+    let folded = crate::fold_each(&refs, how, &folder).map_err(|(at, error)| FilesError::Fold {
+        path: at.map_or_else(|| folder.clone(), |at| paths[at].as_ref().to_path_buf()),
+        error,
+    })?;
+    // The inputs aren't needed past the fold: their memory goes before the writing.
+    drop(refs);
+    drop(inputs);
+    for (target, text) in written.iter().zip(folded.texts) {
         write(target, text.as_bytes())?;
     }
-    Ok(FoldedFiles { written, indexing: folded.indexing })
+    Ok(FoldedFiles {
+        written,
+        indexing: folded.indexing,
+        judged: folded.judged,
+        squeeze: folded.squeeze,
+    })
+}
+
+/// The folder `path` is in: `.` for a bare name.
+fn folder_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 /// Unfolds the files at `paths`, given the index they were folded with, if they need one, writing

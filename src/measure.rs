@@ -4,6 +4,7 @@
 //! it; the tables in docs/observations.md were made the same way.
 
 use crate::alphabet::Alphabet;
+use crate::deadline::Deadline;
 use crate::index::Index;
 use crate::squeeze::{self, Squeeze, TableOptions};
 use std::collections::BTreeSet;
@@ -63,7 +64,10 @@ pub fn measure(input: &[u8], alphabets: &[Alphabet]) -> Vec<Measurement> {
     for squeeze in squeezes(input) {
         let indexing: &[bool] = if squeeze.has_tables() { &[false, true] } else { &[false] };
         for &index in indexing {
-            let Ok(squeezed) = squeeze::squeeze(input, &squeeze, None, index) else { continue };
+            let Ok(squeezed) = squeeze::squeeze(input, &squeeze, None, index, Deadline::NONE)
+            else {
+                continue;
+            };
             let values: BTreeSet<String> = squeezed.tables.index_values().into_iter().collect();
             let kept = (!values.is_empty())
                 .then(|| Index::new(values).expect("a set holds no value twice"));

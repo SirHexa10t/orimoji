@@ -1,7 +1,7 @@
 //! Files folded and unfolded beside themselves and over themselves.
 
 use orimoji::files::{self, FilesError, Output};
-use orimoji::{Alphabet, Fold, Squeeze};
+use orimoji::{Alphabet, Fold, Judged, Squeeze, TableOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -86,5 +86,34 @@ fn a_file_that_fails_leaves_every_file_as_it_was() {
         other => panic!("{other:?}"),
     }
     assert_eq!(std::fs::read_to_string(&good).unwrap(), "some text\n", "nothing was written");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn folds_waiting_to_be_weighed_are_buffered_beside_the_files_and_leave_nothing_behind() {
+    let dir = scratch("buffered");
+    let originals = drawings(&dir);
+    let paths: Vec<PathBuf> = originals.iter().map(|(path, _)| path.clone()).collect();
+    let how = Fold {
+        buffer_past: 0,
+        ..Fold::new(Squeeze::Auto(TableOptions::default()), Alphabet::Base64Url)
+            .indexed()
+            .measured_up_to(std::time::Duration::from_secs(3600))
+    };
+    let folded = files::fold_files(&paths, &how, &Output::default()).unwrap();
+    assert!(matches!(folded.judged, Judged::Measured { .. }), "{:?}", folded.judged);
+    let mut left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["a.txt", "a.txt.folded", "b.txt", "b.txt.folded"]);
+    for (path, _) in &originals {
+        std::fs::remove_file(path).unwrap();
+    }
+    files::unfold_files(&folded.written, folded.indexing.index(), &Output::default()).unwrap();
+    for (path, bytes) in &originals {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }

@@ -151,3 +151,30 @@ fn an_index_asked_for_but_not_worth_it_is_not_written() {
     assert!(!index.exists());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn a_measured_fold_says_what_it_found_or_that_time_ran_out() {
+    let dir = scratch("measure");
+    let art = std::fs::read(format!(
+        "{}/examples/data/long_ascii_anime_postergirl.txt",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let index = dir.join("art.index");
+    let index = index.to_str().unwrap();
+    let (ok, _, said) =
+        orimoji(&["fold", "-s", "text", "--index", index, "--measure-up-to", "1h"], &art);
+    assert!(ok && said.contains("measured") && said.contains("doesn't pay"), "{said}");
+    let (ok, _, said) =
+        orimoji(&["fold", "-s", "text", "--index", index, "--measure-up-to", "0ms"], &art);
+    assert!(ok && said.contains("longer than 0ms") && said.contains("estimates decided"), "{said}");
+    let (ok, _, said) =
+        orimoji(&["fold", "-s", "text", "--index", index, "--measure-up-to", "5x"], &art);
+    assert!(!ok && said.contains("no time"), "{said}");
+    let (ok, _, said) = orimoji(&["fold", "-s", "text", "--measure-up-to", "5s"], &art);
+    assert!(!ok && said.contains("--index"), "measuring needs an index to weigh: {said}");
+    // Auto, the default, measures the squeeze it chose.
+    let (ok, _, said) = orimoji(&["fold", "--index", index, "--measure-up-to", "1h"], &art);
+    assert!(ok && said.contains("with text into") && said.contains("doesn't pay"), "{said}");
+    std::fs::remove_dir_all(dir).unwrap();
+}

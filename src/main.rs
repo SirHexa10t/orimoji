@@ -3,7 +3,7 @@
 use clap::{Args, Parser, Subcommand};
 use orimoji::files::{self, Output};
 use orimoji::measure::{self, Measurement};
-use orimoji::{Alphabet, Fold, Index, Indexing, Squeeze, TableOptions, UnfoldError};
+use orimoji::{Alphabet, Fold, Index, Indexing, Judged, Squeeze, TableOptions, UnfoldError};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -91,6 +91,12 @@ struct FoldArgs {
     /// together share it. With --like, the earlier fold's index, which is kept as it is.
     #[arg(long, value_name = "FILE")]
     index: Option<PathBuf>,
+    /// With --index: measure, not estimate, whether the index pays, by folding without it too and
+    /// keeping the smaller fold, as it is; but spend TIME at most on it (30ms, 5s, 15m, 1h, 2d),
+    /// and past it let the estimates decide. A fold waiting to be weighed is buffered in a
+    /// temporary file once it is past 8 MiB: beside the output, or in TMPDIR for standard output.
+    #[arg(long, value_name = "TIME", requires = "index")]
+    measure_up_to: Option<String>,
     /// Keep the tables of this earlier fold, so lines that didn't change fold the same.
     #[arg(long, value_name = "FOLDED")]
     like: Option<PathBuf>,
@@ -164,10 +170,6 @@ fn fold(args: FoldArgs) -> Result<(), Box<dyn std::error::Error>> {
     if previous.is_some() && args.files.files.len() > 1 {
         return Err("--like keeps the tables of one fold, for one input".into());
     }
-    let inputs: Vec<Vec<u8>> = match args.files.files.is_empty() {
-        true => vec![read(None)?],
-        false => args.files.files.iter().map(std::fs::read).collect::<Result<_, _>>()?,
-    };
     let name = match (args.squeeze.as_str(), &previous) {
         // Keeping tables means keeping the squeeze they belong to.
         ("auto", Some(previous)) => orimoji::folded_with(previous)?.0,
@@ -188,7 +190,7 @@ fn fold(args: FoldArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     let asked = args.index.is_some() && previous.is_none();
     let squeeze = match name.as_str() {
-        "auto" => orimoji::pick(&inputs.concat(), alphabet, asked),
+        "auto" => Squeeze::Auto(table),
         "none" => Squeeze::None { whole: args.whole },
         "pack" => Squeeze::Pack,
         "text" => Squeeze::Text,
@@ -202,14 +204,24 @@ fn fold(args: FoldArgs) -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     };
-    let how = Fold { squeeze, alphabet, wrap: args.wrap, readable: args.readable, index: asked };
-    let said = |input: usize, folded: usize, written: &str| {
+    let measure_up_to = args.measure_up_to.as_deref().map(orimoji::time_limit).transpose()?;
+    // A stream folded into a file is buffered beside it, on its disk; files, beside themselves.
+    let output = args.files.output.as_ref().filter(|path| path.as_os_str() != "-");
+    let how = Fold {
+        wrap: args.wrap,
+        readable: args.readable,
+        index: asked,
+        measure_up_to,
+        buffer_folder: output.map(|path| folder_of(path).to_path_buf()),
+        ..Fold::new(squeeze, alphabet)
+    };
+    let said = |input: usize, folded: usize, squeeze: &Squeeze, written: &str| {
         if !args.quiet {
             eprintln!(
                 "orimoji: {input} bytes folded into {folded} ({:.0}%), with {} into {alphabet}{}{written}",
                 100.0 * folded as f64 / input.max(1) as f64,
-                how.squeeze.describe(),
-                if how.squeeze.by_line() { ", a line for each line" } else { "" },
+                squeeze.describe(),
+                if squeeze.by_line() { ", a line for each line" } else { "" },
             );
         }
     };
@@ -220,41 +232,65 @@ fn fold(args: FoldArgs) -> Result<(), Box<dyn std::error::Error>> {
             )?),
             false => None,
         };
-        let text = orimoji::fold_keeping(&inputs[0], previous, index.as_ref(), &how)?;
+        let input = read(args.files.files.first())?;
+        let text = orimoji::fold_keeping(&input, previous, index.as_ref(), &how)?;
         let target = match one_stream {
             true => args.files.output.clone(),
             false => Some(written_beside(&args.files.files[0], &args.files.output())),
         };
         write(target.as_ref(), text.as_bytes())?;
-        said(inputs[0].len(), text.len(), "");
+        said(input.len(), text.len(), &how.squeeze, "");
         return Ok(());
     }
-    let indexing = match one_stream {
+    let (indexing, judged) = match one_stream {
         true => {
-            let folded = orimoji::fold(&inputs[0], &how)?;
+            let input = read(args.files.files.first())?;
+            let folded = orimoji::fold(&input, &how)?;
             write(args.files.output.as_ref(), folded.text.as_bytes())?;
-            said(inputs[0].len(), folded.text.len(), "");
-            folded.indexing
+            said(input.len(), folded.text.len(), &folded.squeeze, "");
+            (folded.indexing, folded.judged)
         }
         false => {
+            // The files are read by the fold itself; here, only their sizes, before any is
+            // written over.
+            let size_of = |path: &PathBuf| std::fs::metadata(path).map_or(0, |m| m.len() as usize);
+            let input: usize = args.files.files.iter().map(size_of).sum();
             let folded = files::fold_files(&args.files.files, &how, &args.files.output())?;
-            let size: usize = folded
-                .written
-                .iter()
-                .map(|path| std::fs::metadata(path).map_or(0, |m| m.len() as usize))
-                .sum();
-            let input: usize = inputs.iter().map(Vec::len).sum();
+            let size: usize = folded.written.iter().map(size_of).sum();
             let files = folded.written.len();
             said(
                 input,
                 size,
+                &folded.squeeze,
                 &format!(", {files} file{} written", if files == 1 { "" } else { "s" }),
             );
-            folded.indexing
+            (folded.indexing, folded.judged)
         }
     };
+    if !args.quiet {
+        tell_judged(judged, args.measure_up_to.as_deref());
+    }
     keep_index(&indexing, args.index.as_deref(), args.quiet)?;
     Ok(())
+}
+
+/// Says how a measured fold decided its index.
+fn tell_judged(judged: Judged, limit: Option<&str>) {
+    match judged {
+        Judged::Estimated => {}
+        Judged::Measured { indexed, unindexed } => eprintln!(
+            "orimoji: measured {indexed} bytes indexed, index included, against {unindexed} without: {}",
+            if unindexed <= indexed {
+                "the index doesn't pay, so there is none"
+            } else {
+                "the index pays"
+            }
+        ),
+        Judged::OutOfTime => eprintln!(
+            "orimoji: measuring took longer than {}, so the estimates decided",
+            limit.unwrap_or("its time")
+        ),
+    }
 }
 
 /// Writes the index a fold made where the caller asked, or says why there is none.
@@ -304,6 +340,14 @@ fn unfold(args: UnfoldArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     Ok(())
+}
+
+/// The folder `path` is in: `.` for a bare name.
+fn folder_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 /// Where a fold of `path` is written, as `output` says.

@@ -21,6 +21,11 @@ pub enum FoldError {
     NoZstd,
     /// A compressor failed.
     Compressor(String),
+    /// A measurement ran out of the time it was given. orimoji's own folds catch this and fall
+    /// back to the estimates, so a caller never sees it from them.
+    OutOfTime,
+    /// A fold buffered in a temporary file while another was made couldn't be read back.
+    Buffer(std::io::Error),
 }
 
 impl fmt::Display for FoldError {
@@ -40,11 +45,22 @@ impl fmt::Display for FoldError {
             }
             FoldError::NoZstd => write!(f, "this build of orimoji has no zstd"),
             FoldError::Compressor(why) => write!(f, "the compressor failed: {why}"),
+            FoldError::OutOfTime => write!(f, "the measurement ran out of time"),
+            FoldError::Buffer(error) => {
+                write!(f, "a fold buffered in a temporary file couldn't be read back: {error}")
+            }
         }
     }
 }
 
-impl std::error::Error for FoldError {}
+impl std::error::Error for FoldError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FoldError::Buffer(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Why a folded file couldn't be unfolded.
 #[derive(Debug)]
