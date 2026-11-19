@@ -1,0 +1,38 @@
+# A library first, like its siblings: the `orimoji` binary is a thin shell over the crate, so a
+# program embedding it (arterminal, catalogames) reaches every fold the command line does. Every
+# dependency below carries the reason it is here.
+[package]
+name = "orimoji"
+version = "0.1.0"
+edition = "2024"
+# Edition 2024's own minimum; nothing here needs more.
+rust-version = "1.85"
+description = "Fold text and data into fewer characters, fewer bytes or narrower lines, and unfold it back exactly"
+license = "GPL-3.0-only"
+repository = "https://github.com/SirHexa10t/orimoji"
+
+[features]
+default = ["cli", "zstd"]
+# The command line: clap. Library users can opt out with `default-features = false`.
+cli = ["dep:clap"]
+# The zstd squeeze, smallest of the whole-file ones. It builds zstd's C library, which a program
+# that only folds line by line shouldn't have to.
+zstd = ["dep:zstd"]
+
+[[bin]]
+name = "orimoji"
+path = "src/main.rs"
+required-features = ["cli"]
+
+# Runs the binary, which only a `cli` build has.
+[[test]]
+name = "cli"
+required-features = ["cli"]
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"], optional = true }
+# Deflate, for the deflate squeezes and for measuring what git stores, since git keeps every
+# object zlib-compressed. The `zlib-rs` backend is pure Rust, and unlike the default one it takes a
+# preset dictionary, which is how a line leans on the lines above it.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+zstd = { version = "0.14", optional = true }
