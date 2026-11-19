@@ -99,6 +99,12 @@ impl Index {
         format!("{}.{:08x}", self.values.len(), fingerprint(&self.values))
     }
 
+    /// The fingerprint of its first `count` values, which a fold into parts records with how many
+    /// values it was folded with.
+    pub(crate) fn fingerprint_of(&self, count: usize) -> u32 {
+        fingerprint(&self.values[..count.min(self.values.len())])
+    }
+
     /// Whether this is the index `mark` was written for, or that index with values added at its
     /// end.
     pub(crate) fn fits(&self, mark: &str) -> bool {

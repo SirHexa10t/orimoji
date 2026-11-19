@@ -14,8 +14,9 @@ Two sibling projects gave orimoji its test data, each a kind of file it was made
 - **arterminal's three example drawings**, as arterminal saves them: a 13 KB ASCII-art poster
   ("long art"), a 1.1 KB braille drawing ("Kirino"), and a 6.4 KB drawing of coloured block
   elements ("Miku"), whose colours are terminal escapes. Small files, kept in a repository a line
-  per row, which arterminal folds with its own *crumple*: canonical Huffman codes per row in
-  base64, the approach orimoji's text and table squeezes grew from.
+  per row, which arterminal folded with its own *crumple*: canonical Huffman codes per row in
+  base64, the approach orimoji's text and table squeezes grew from. Its crumpled form is
+  orimoji's fold now; crumple's own codec is its version 1, still read.
 
 `examples/data` holds copies: the three drawings as arterminal ships them, and the listing's header
 with its first 400 rows.
@@ -85,6 +86,92 @@ In git, none of these beats the drawing as it is: a small, repetitive drawing is
 compresses best, and the indexed text squeeze's files take 121–144% of what git stores for the
 drawings themselves (zstd's, 95–128%). Folding a drawing buys a smaller checkout and fewer
 characters, not a smaller repository; the listing, big and regular, gets both.
+
+### Against crumple, part by part
+
+For a while arterminal's crumpled form was the indexed text squeeze, measured, into base64url
+(its version 2), and crumple's own codec (its version 1) made the drawings smaller. Where the
+bytes went, crumple's against the fold's:
+
+| Part | Long art | Kirino | Miku |
+|---|--:|--:|--:|
+| The code table | 108 → 277 | 161 → 362 | 47 → 251 |
+| orimoji's header and `=== body ===` lines | +46 | +46 | +46 |
+| The index, with its header options | | | +178 |
+| The rows (crumple's: a line of characters and a line of colours each) | 3,761 → 3,761 | 289 → 290 | 942 → 810 |
+| The palette, and the last newline | +1 | +1 | 119 → 159 |
+| **All of it** | **3,899 → 4,115** | **480 → 729** | **1,138 → 1,474** |
+
+The rows are not where it loses. Both spell the characters the same way: one Huffman code for the
+drawing, and three or more of a character as the first, a run symbol and a count. On Miku the fold's
+rows are the smaller, its escapes being single symbols where crumple writes a second line of colour
+runs. The fold loses on the rest:
+
+- **The table.** Crumple writes each code length as one base64 digit, and each character as its step
+  from the one before, so a braille drawing's characters, all within 256 code points, cost two
+  bytes each. The text squeeze writes a line per symbol and deflates them. Written crumple's way,
+  its tables would take about 109, 162 and 98 B.
+- **Miku's colours, kept twice:** as palette lines in the fold, and as escapes in the index. Crumple
+  numbers them into the palette it carries anyway, and copies that as it is.
+
+### Parts, against crumple
+
+A fold into parts closes that gap where it was: the table and the colours. arterminal's version 3
+gives orimoji a drawing's characters alone, a line a row, and keeps the colours as crumple did. The
+characters, crumple's way against folded into parts:
+
+| The characters | Long art | Kirino | Miku |
+|---|--:|--:|--:|
+| Crumple: table and rows | 108 + 3,761 = 3,869 | 161 + 289 = 450 | 47 + 554 = 601 |
+| Parts: table, choices and rows | 75 + 8 + 3,704 = 3,787 | 115 + 8 + 290 = 413 | 36 + 8 + 522 = 566 |
+| A folded file of the same | 4,084 | 698 | 738 |
+
+The compact table takes 69%, 71% and 77% of the bytes crumple's does; on Kirino each of 78
+characters still costs a step and five bits of code length. The rows come out smaller where runs
+are many: the long art's counts in a Huffman code of their own, Miku's with one low bit written as
+it is, and her blocks, whose code is a single bit, written again where that is shorter than a run.
+Kirino's few runs keep Elias gamma, and her rows the size crumple made them. Whole, with the
+colours and the palette as crumple keeps them, arterminal's drawings crumple to 3,817, 443 and
+1,103 B, where crumple's own codec made 3,899, 480 and 1,138, and the whole document folded made
+4,115, 729 and 1,474.
+
+### Runs
+
+Both write a run's count in Elias gamma: a run of 3 is one bit, and a count takes two more each
+time a run doubles. Counted on crumple's rows, where the counts are a quarter of the bits on two of
+the drawings, other codes for the same counts would take:
+
+| Bits for the runs' counts | Long art | Kirino | Miku |
+|---|--:|--:|--:|
+| Runs, and the longest | 1,113, of 77 | 27, of 13 | 167, of 40 |
+| Elias gamma, as written | 5,245 (25% of the rows) | 73 (5%) | 793 (26%) |
+| A fixed width, wide enough for the longest | 7,791 | 108 | 1,002 |
+| Exp-Golomb, with the drawing's best k | 4,955 (k = 2) | 73 (k = 0) | 626 (k = 1) |
+| A Huffman code of their own, its table included | ~5,300 | ~173 | ~596 |
+
+Most runs are short (252 of the long art's are three long), and a width that fits the longest run
+makes every one of them pay what the longest needs. Exp-Golomb writes a count's last k bits as they
+are and the rest in gamma, so k = 0 is gamma itself.
+
+Three or more of a character is always a run, though repeating a character whose code is short is
+shorter: Miku's `█` has a 1-bit code, so `███` is 3 bits as it is and 5 as a run.
+Choosing run by run would save about 17 B of Miku's 1,138, from 42 of her 167 runs, and nothing on
+the other two.
+
+### Pixels two characters wide
+
+Miku is drawn in pixels two characters wide, as terminal art often is, a cell being about twice as
+tall as it is wide: 32 of her 33 rows are pairs of one character throughout, the last being a
+comment. So each pixel is spelled twice, and every run is counted in characters: her runs are all
+of even length. Spelling a pixel once, on crumple's character rows (3,761, 289 and 554 B):
+
+| | Long art | Kirino | Miku |
+|---|--:|--:|--:|
+| A line made of pairs marked as one, and spelled a pair to a symbol | ±0 | ±0 | −131 B (−24%) |
+| A pair of one character as a unit, wherever it falls | +142 B | −3 B | −154 B (−28%) |
+
+Taking any pair as a unit helps Miku a little more, but costs the long art, whose characters pair
+by chance.
 
 ## Lines leaning on lines
 
@@ -232,9 +319,11 @@ orimoji has deflate and zstd: brotli and xz came within a few percent of zstd 19
 
 On one core of a Ryzen 9 9950X3D. The alphabets folded and unfolded 1 MiB of random bytes, best of
 5. Peak memory is the fold's maximum resident set; with a buffer in tmpfs counted, the peak of its
-memory cgroup, which charges tmpfs pages to the fold that wrote them. An indexed fold is measured with its index, kept as text. The listing is catalogames' local
-`steam-games.tsv`, from its sweep of 2026-09-26. The drawings are arterminal's examples as
-arterminal saves them. The size in git is zlib at level 6, git's default for packs.
-`orimoji measure` made the result tables; the deflate rows under
-[Lines leaning on lines](#lines-leaning-on-lines) and the whole-file compressors came from a
-scratch benchmark of the same libraries, and crumple's sizes from arterminal itself.
+memory cgroup, which charges tmpfs pages to the fold that wrote them. An indexed fold is measured
+with its index, kept as text. The listing is catalogames' local `steam-games.tsv`, from its sweep of
+2026-09-26. The drawings are arterminal's examples as arterminal saves them. The size in git is zlib
+at level 6, git's default for packs. `orimoji measure` made the result tables; the deflate rows
+under [Lines leaning on lines](#lines-leaning-on-lines) and the whole-file compressors came from a
+scratch benchmark of the same libraries, and crumple's sizes from arterminal itself. The parts, runs
+and pixels of the drawings against crumple came from a decoder of crumple's version 1, run over
+arterminal's `.crumpled` examples.

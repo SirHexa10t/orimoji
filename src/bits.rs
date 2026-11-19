@@ -42,6 +42,16 @@ impl Bits {
     pub fn reader(&self) -> BitReader<'_> {
         BitReader { bytes: &self.bytes, len: self.len, at: 0 }
     }
+
+    /// Its first `len` bits, or all of them if it has fewer.
+    pub fn prefix(&self, len: usize) -> Bits {
+        let len = len.min(self.len);
+        let mut bytes = self.bytes[..len.div_ceil(8)].to_vec();
+        if let (Some(last), 1..) = (bytes.last_mut(), len % 8) {
+            *last &= 0xFF << (8 - len % 8);
+        }
+        Bits { bytes, len }
+    }
 }
 
 /// Builds [`Bits`], most significant bit first.
@@ -126,6 +136,11 @@ impl<'a> BitReader<'a> {
 }
 
 impl BitReader<'_> {
+    /// How many bits have been read.
+    pub fn position(&self) -> usize {
+        self.at
+    }
+
     /// How many bits are left.
     pub fn remaining(&self) -> usize {
         self.len - self.at

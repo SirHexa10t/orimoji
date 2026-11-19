@@ -69,6 +69,12 @@
 //!
 //! [`files::fold_files`] and [`files::unfold_files`] do the same to files, in place or beside them
 //! with a suffix, as the caller's [`Output`] says; files folded together share one index.
+//!
+//! # Parts
+//!
+//! A program with a file format of its own folds into [`parts`] instead: the lines, the code they
+//! are spelled in and the choices the fold made, for it to keep where it suits, smaller than a
+//! folded file and with no header of their own.
 
 pub mod alphabet;
 pub mod bits;
@@ -76,6 +82,7 @@ pub mod files;
 pub mod huffman;
 pub mod index;
 pub mod measure;
+pub mod parts;
 pub mod squeeze;
 pub mod words;
 

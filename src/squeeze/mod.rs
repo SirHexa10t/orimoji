@@ -8,7 +8,7 @@ pub(crate) mod deflate;
 mod pack;
 mod plain;
 mod table;
-mod text;
+pub(crate) mod text;
 mod zstd;
 
 pub use table::TableOptions;

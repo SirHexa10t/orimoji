@@ -135,13 +135,36 @@ assert_eq!(orimoji::unfold(&next, index)?, newer);
 
 `orimoji::fold_all` folds several inputs into one shared index, and `orimoji::files` folds files in
 place or beside themselves (`Output::InPlace`, `Output::Suffix`). `Squeeze::Auto` is `auto`, and
-every fold says which squeeze made it (`folded.squeeze`). `Fold::measured_up_to` measures whether the
-index pays, `Judged` says how it was decided, and `orimoji::time_limit` reads limits like `5s`.
+every fold says which squeeze made it (`folded.squeeze`). `Fold::measured_up_to` measures whether
+the index pays, `Judged` says how it was decided, and `orimoji::time_limit` reads limits like `5s`.
 `Fold::buffer_past` and `Fold::buffer_folder` say when and where a fold waiting to be weighed goes
 to a temporary file. `Index::to_text` and `Index::from_text` keep an index as text, and
 `orimoji::needs_index` says whether a stored text needs one. `orimoji::measure` measures,
 `orimoji::words` writes words from a fixed list as numbers, and `Alphabet` folds bytes or bits by
 itself.
+
+### Parts
+
+A program with a file format of its own folds into parts instead (`orimoji::parts`): a line for
+each line of the text, the code they are spelled in, and the choices the fold made, each one line
+of the alphabet, and the index when one paid. The program keeps them where it suits, under no
+header of orimoji's, and gives them back to unfold; arterminal keeps a drawing's characters so.
+
+```rust
+use orimoji::{Alphabet, parts};
+
+let folded = parts::fold("⣿⣿⣿⡇\n⣿⡇ ⢸", Alphabet::Base64Url, false);
+// folded.lines, folded.table and folded.choices, kept wherever suits:
+let (lines, table, choices) = (&folded.lines, &folded.table, &folded.choices);
+let back = parts::unfold(lines, table, choices, None, Alphabet::Base64Url, 1 << 20)?;
+```
+
+It is the text squeeze, with three things a folded file doesn't have yet: a compact code table,
+each character a step from the one before; a run only where it is shorter than writing its unit
+again; and runs' counts in whichever code writes them shortest, which the choices record. The
+choices also carry a fingerprint of the table and the index, so parts that don't belong together
+are refused rather than read wrong, and unfolding takes a limit, refusing a fold that would come to
+more before making it. The format is in [docs/format.md](docs/format.md#parts).
 
 ### Examples
 

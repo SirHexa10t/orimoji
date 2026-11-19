@@ -88,6 +88,15 @@ pub enum UnfoldError {
     WrongIndex,
     /// An index's text doesn't read.
     Index(String),
+    /// The choices of a fold into parts don't read, or are a newer format's.
+    Choices(String),
+    /// The code table of a fold into parts doesn't read.
+    CodeTable(String),
+    /// The table, the choices or the index aren't the ones a fold into parts made its lines with:
+    /// one is damaged, or comes from another fold.
+    PartsDontFit,
+    /// A line would make the text more than the limit it was unfolded with.
+    TooLarge { line: usize, limit: usize },
 }
 
 impl fmt::Display for UnfoldError {
@@ -114,6 +123,16 @@ impl fmt::Display for UnfoldError {
                 write!(f, "the index given isn't the one it was folded with")
             }
             UnfoldError::Index(why) => write!(f, "the index: {why}"),
+            UnfoldError::Choices(why) => write!(f, "the choices: {why}"),
+            UnfoldError::CodeTable(why) => write!(f, "the code table: {why}"),
+            UnfoldError::PartsDontFit => write!(
+                f,
+                "the table, the choices and the index aren't the ones the lines were folded with: \
+                 one is damaged, or from another fold"
+            ),
+            UnfoldError::TooLarge { line, limit } => {
+                write!(f, "line {line}: it would unfold to more than {limit} bytes")
+            }
         }
     }
 }

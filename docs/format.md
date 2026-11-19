@@ -169,6 +169,53 @@ values, each followed by `\n`. An index fits the text if it has at least that ma
 first `<count>` of them hash the same, so an index that grew at its end still fits. Unfolding such
 a text without an index, or with one that doesn't fit, is refused.
 
+## Parts
+
+A fold into parts (`orimoji::parts`) has no header and no file: three things, each a line of the
+alphabet its caller chose, and the index when one paid. The caller keeps them, and knows the
+alphabet; the squeeze is always the text squeeze.
+
+### Choices
+
+| Bits | Hold |
+|---|---|
+| 4 | the parts' format, `1`; a newer one is refused by its number |
+| 3 | `k`: how many low bits of a run's count are written as they are |
+| 1 | whether the count's bucket has a Huffman code of its own (`1`) or is in unary (`0`) |
+| 1 | whether the lines need an index |
+| Elias gamma | when they do, how many of the index's values they were folded with |
+| 32 | the fingerprint: FNV-1a over `<format> <k> <coded> <values>.<index fingerprint>\n`, the index's fingerprint as for a folded file's header, in 8 hex digits (`0` for none), then the table as written |
+
+An index that grew at its end still fits, as for a folded file. Choices whose fingerprint isn't the
+table's and the index's are refused: one of the parts is damaged, or comes from another fold.
+
+### The code table
+
+Numbers in Elias gamma, code lengths in five bits each, from 1 to 30:
+
+- how many characters, plus one; then how many longer texts (indexed words and escapes), plus one;
+- the code lengths of `<end>`, `<esc>` and `<run>`;
+- each character, in code point order: its step from the one before (the first, its code point
+  plus one), and its code length;
+- each longer text, in the order of its place in the index: its step from the place before (the
+  first, its place plus one), and its code length;
+- when counts are coded, how many buckets there are, and each one's code length.
+
+Symbols are numbered in that order, and the codes follow from their lengths, as everywhere.
+
+### Lines
+
+A line is spelled as the text squeeze spells it (see [The text code](#the-text-code)), but for two
+things. A run's count `c`, the repeats past the first two, is split into its `k` low bits and the
+rest: the rest plus one, `h`, is written as its bucket (its length in bits, less one), in unary
+(that many zeros, then a one) or in the buckets' code; then `h`'s bits after its leading one; then
+the `k` low bits. In unary with `k = 0`, that is a folded file's gamma(repeats − 1). And a writer
+may write a unit again instead of a run, wherever that is shorter: a reader takes either.
+
+A line, the table and the choices must each be exactly what folding their bits gives: nothing after
+the last code but the zeros that fill out the last character. An empty line stands for an empty
+line, and no other line is empty.
+
 ## Alphabets
 
 The characters of each alphabet are in [theory.md](theory.md#alphabets-to-fold-into). Folding:
