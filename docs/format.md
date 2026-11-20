@@ -1,7 +1,17 @@
 # The folded file
 
-Format version 1, as `orimoji` writes and reads it. Why it is built this way is in
-[theory.md](theory.md).
+Formats 1 to 3, as `orimoji` writes and reads them. A file is written in the oldest format that
+holds it:
+
+- **1:** a folded file that needs nothing outside itself, or an index kept beside it, as every
+  indexed fold once was;
+- **2:** a folded file that keeps its index inside it, in its tables (see [The index](#the-index));
+- **3:** the `.ori` and `.orinv` files the text squeeze writes, which keep a fold's unit with its
+  lines (see [.ori and .orinv](#ori-and-orinv)); a fold that keeps its index beside it, as the
+  first format did, writes the text squeeze's as a folded file of format 1.
+
+A file of a newer format than the reader's is refused by its number. Why it is built this way is
+in [theory.md](theory.md).
 
 ```text
 === orimoji 1 table base64url ===
@@ -34,7 +44,7 @@ reads the same, and so does one whose lines end in `\r\n`.
 | `whole` | `none`, `deflate`, `zstd` | the body is one stream, folded in pieces |
 | `size=<bytes>` | the same | the size of what was folded; an unfold that comes out any other size is refused, and decompression stops past it |
 | `lean=<lines>` | `deflate` | a line at a time, each with the `<lines>` lines above as its dictionary |
-| `index=<count>.<fingerprint>` | `text`, `table` | the text needs an index: see [The index](#the-index) |
+| `index=<count>.<fingerprint>` | `text`, `table` | the text was folded with an index: inside its tables in format 2, beside it in format 1; see [The index](#the-index) |
 
 ### Tables
 
@@ -54,6 +64,10 @@ break a line or vanish:
 | `\<` | a `<` at the very start, since an entry spelled `<end>` is a marker |
 | `\@` | an `@` at the very start, since an entry spelled `@3` is a place in the index |
 | `\0` | nothing: an empty text, so that an entry is never blank |
+
+In format 2, the tables end in an `=== index ===` section: the index the file was folded with, a
+value a line, escaped as above, and a value starting with `=` starting with `\u{3d}` instead, so
+that no value reads as a section line. It is deflated with the rest of the tables.
 
 ### Body
 
@@ -152,9 +166,16 @@ each followed by `\n`. `zstd` writes one standard zstd frame of the whole file.
 
 ## The index
 
-An indexed fold hands its index back beside the folded text, as a list of values; the folded text
-refers to them by place, `@0` for the first. Kept as text, the index is a header line and then a
-value a line, escaped as above:
+An indexed fold refers to the values of its index by place, `@0` for the first. A folded text that
+refers to an index has `index=<count>.<fingerprint>` in its header: the number of values the index
+had when the text was folded, and the 32-bit FNV-1a hash, in hex, of those values, each followed by
+`\n`. An index fits the text if it has at least that many values and the first `<count>` of them
+hash the same, so an index that grew at its end still fits.
+
+In format 2, the index is inside the file, in its tables' `=== index ===` section (see
+[Tables](#tables)), and the file unfolds alone. In format 1, it was handed back beside the folded
+text, for the caller to keep and give back when unfolding; kept as text, it is a header line and
+then a value a line, escaped as above:
 
 ```text
 === orimoji index 1 ===
@@ -163,11 +184,8 @@ Gearbox Software
 Valve
 ```
 
-A folded text that refers to an index has `index=<count>.<fingerprint>` in its header: the number
-of values the index had when the text was folded, and the 32-bit FNV-1a hash, in hex, of those
-values, each followed by `\n`. An index fits the text if it has at least that many values and the
-first `<count>` of them hash the same, so an index that grew at its end still fits. Unfolding such
-a text without an index, or with one that doesn't fit, is refused.
+Unfolding a format 1 text that needs an index without one, or with one that doesn't fit, is
+refused; so is a format 2 text whose index doesn't fit its header.
 
 ## Parts
 
@@ -177,29 +195,40 @@ alphabet; the squeeze is always the text squeeze.
 
 ### Choices
 
+Every way the fold could write something one of several ways, and the way it took, in bits;
+`orimoji::parts::decisions` reads them back.
+
 | Bits | Hold |
 |---|---|
-| 4 | the parts' format, `1`; a newer one is refused by its number |
+| 4 | the parts' format, `2`; a newer one is refused by its number |
 | 3 | `k`: how many low bits of a run's count are written as they are |
 | 1 | whether the count's bucket has a Huffman code of its own (`1`) or is in unary (`0`) |
+| 4 | how many low bits of a character's step, in the table, are written as they are |
+| 2 | how the table writes its code lengths: `0` five bits each, `1` in a Huffman code of their own; another number is refused, as a way this orimoji doesn't know |
 | 1 | whether the lines need an index |
 | Elias gamma | when they do, how many of the index's values they were folded with |
-| 32 | the fingerprint: FNV-1a over `<format> <k> <coded> <values>.<index fingerprint>\n`, the index's fingerprint as for a folded file's header, in 8 hex digits (`0` for none), then the table as written |
+| 32 | the fingerprint: FNV-1a over `<format> <k> <coded> <step bits> <lengths> <values>.<index fingerprint>\n`, the index's fingerprint as for a folded file's header, in 8 hex digits (`0` for none), then the table as written |
 
-An index that grew at its end still fits, as for a folded file. Choices whose fingerprint isn't the
-table's and the index's are refused: one of the parts is damaged, or comes from another fold.
+Format 1 had neither the step's bits nor the way of writing lengths, and its fingerprint leaves
+them out: its tables wrote steps in Elias gamma and lengths in five bits, as format 2's do with
+`0` and `0`. An index that grew at its end still fits, as for a folded file. Choices whose
+fingerprint isn't the table's and the index's are refused: one of the parts is damaged, or comes
+from another fold.
 
 ### The code table
 
-Numbers in Elias gamma, code lengths in five bits each, from 1 to 30:
+Numbers in Elias gamma, code lengths (from 1 to 30) as the choices say:
 
 - how many characters, plus one; then how many longer texts (indexed words and escapes), plus one;
+- for lengths in a code of their own, that code: the longest length, in five bits, then for each
+  length up to it the length of its own code, in five bits, 0 for a length no symbol has;
 - the code lengths of `<end>`, `<esc>` and `<run>`;
 - each character, in code point order: its step from the one before (the first, its code point
-  plus one), and its code length;
+  plus one), and its code length. The step less one is in Exp-Golomb: all but its low bits, plus
+  one, in Elias gamma, then the low bits as they are, as many as the choices say;
 - each longer text, in the order of its place in the index: its step from the place before (the
-  first, its place plus one), and its code length;
-- when counts are coded, how many buckets there are, and each one's code length.
+  first, its place plus one), in Elias gamma, and its code length;
+- when counts are coded, how many buckets there are, and each one's code length, in five bits.
 
 Symbols are numbered in that order, and the codes follow from their lengths, as everywhere.
 
@@ -215,6 +244,53 @@ may write a unit again instead of a run, wherever that is shorter: a reader take
 A line, the table and the choices must each be exactly what folding their bits gives: nothing after
 the last code but the zeros that fill out the last character. An empty line stands for an empty
 line, and no other line is empty.
+
+## .ori and .orinv
+
+The text squeeze folds into parts, and keeps each fold's unit (its choices, its code table and its
+index) with its lines, in format 3. A file folded
+alone is one `.ori`, its unit inside it:
+
+```text
+=== orimoji 3 text base64url index=2 ===
+=== unit ===
+IgHKTHHM
+CsqhghG1A-RVVPO00t…
+God
+and
+=== body ===
+_8wTxNYlmw
+…
+```
+
+1. **The header line:** the format, `text`, the alphabet, and `index=<values>` when the unit has an
+   index of that many values.
+2. **The unit:** `=== unit ===`, then the choices, the code table, and each of the index's values,
+   escaped as in [Tables](#tables), a line each, as many as the header counts.
+3. **The body:** `=== body ===`, then the parts' lines, a line for each line of the text, as in
+   [Lines](#lines-1).
+
+Files folded together share one unit, learnt over all of them, kept once in an `.orinv`: the
+header line and the unit, and no body. Each file's `.ori` holds only its lines, and names the
+`.orinv` and the unit it holds:
+
+```text
+=== orimoji 3 text base64url orinv=chapters.orinv unit=3f2a91c0 ===
+=== body ===
+_8wTxNYlmw
+…
+```
+
+Of files folded together, those that take less alone are written as if each had been folded
+alone, an `.ori` holding its unit; only the files that share name the `.orinv`.
+
+`orinv=` is the `.orinv`'s path from the `.ori`'s own folder, escaped as in [Tables](#tables), and a
+space as `\u{20}`, so that the path is one word. `unit=` is the unit's fingerprint, in 8 hex
+digits: FNV-1a, 32 bits, of the unit's text (its choices, its table and its escaped values, each
+followed by `\n`). An `.ori` is unfolded only with a unit of that fingerprint; with no unit, or
+another, it is refused. A writer replaces an `.orinv` only when no file it can find (in the
+`.orinv`'s folder and in the folders of the files it is writing) names it with the fingerprint of
+the unit it holds.
 
 ## Alphabets
 

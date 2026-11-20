@@ -123,17 +123,32 @@ characters, crumple's way against folded into parts:
 | The characters | Long art | Kirino | Miku |
 |---|--:|--:|--:|
 | Crumple: table and rows | 108 + 3,761 = 3,869 | 161 + 289 = 450 | 47 + 554 = 601 |
-| Parts: table, choices and rows | 75 + 8 + 3,704 = 3,787 | 115 + 8 + 290 = 413 | 36 + 8 + 522 = 566 |
+| Parts: table, choices and rows | 70 + 9 + 3,704 = 3,783 | 80 + 9 + 290 = 379 | 36 + 9 + 522 = 567 |
 | A folded file of the same | 4,084 | 698 | 738 |
 
-The compact table takes 69%, 71% and 77% of the bytes crumple's does; on Kirino each of 78
-characters still costs a step and five bits of code length. The rows come out smaller where runs
-are many: the long art's counts in a Huffman code of their own, Miku's with one low bit written as
-it is, and her blocks, whose code is a single bit, written again where that is shorter than a run.
-Kirino's few runs keep Elias gamma, and her rows the size crumple made them. Whole, with the
-colours and the palette as crumple keeps them, arterminal's drawings crumple to 3,817, 443 and
-1,103 B, where crumple's own codec made 3,899, 480 and 1,138, and the whole document folded made
-4,115, 729 and 1,474.
+The compact table takes 65%, 50% and 77% of the bytes crumple's does. The long art's and Kirino's
+write their code lengths in a code of their own: Kirino's 81, from 3 bits to 8, take her table from
+115 bytes, five bits each, to 80. Miku's 23 are too few to pay for describing a code, and stay five
+bits each. The rows come out smaller where runs are many: the long art's counts in a Huffman
+code of their own, Miku's with one low bit written as it is, and her blocks, whose code is a single
+bit, written again where that is shorter than a run. Kirino's few runs keep Elias gamma, and her
+rows the size crumple made them. Whole, with the colours and the palette as crumple keeps them,
+arterminal's drawings crumple to 3,813, 409 and 1,104 B, where crumple's own codec made 3,899,
+480 and 1,138, and the whole document folded made 4,115, 729 and 1,474.
+
+Writing the table's characters as steps from the one before beats every other way of naming them,
+in bits:
+
+| The characters | Long art | Kirino | Miku | Genesis | Scattered scripts |
+|---|--:|--:|--:|--:|--:|
+| How many | 52 | 78 | 20 | 74 | 65 |
+| Steps from the one before, in Elias gamma | 112 | 262 | 82 | 108 | 649 |
+| The same, with the best low bits as they are | 112 | 262 | 82 | 108 | 600 (3 bits) |
+| Distances from their mean | 513 | 1,009 | 477 | 723 | 1,799 |
+| Distances from their median | 511 | 997 | 253 | 721 | 1,449 |
+| Each its own 21 bits | 1,092 | 1,638 | 420 | 1,554 | 1,365 |
+
+Low bits as they are pay only where scripts are scattered, the steps between them large.
 
 ### Runs
 
@@ -245,12 +260,112 @@ Two changes went with buffering. A fold used to hold its body twice at its end, 
 folded text: `pack` peaked at 380 MiB and `none` at 243 MiB. And `auto` used to fold the squeeze it
 chose a second time: `auto --index` took 7.4 s and peaked at 413 MiB.
 
-## One index for several files
+## Files folded together
 
-The three drawings folded together share one index (`cargo run --example shared_index`): 6,211
-bytes in all, against 6,235 with an index each. They have few values in common (the escapes are
-the coloured drawing's alone), so sharing saves little here; it pays where files repeat each
-other's values, as the sweeps of one listing do.
+Files folded together share one unit, its code and its index learnt over all of them and kept once,
+in an `.orinv` (`cargo run --release --example folded_together -- FILE…`). Where they spell alike,
+it pays; where they don't, one code for all of them spells each worse than its own would, and the
+unit kept once doesn't make up for it. The three drawings take 6,158 bytes together, the `.orinv`
+(378 bytes) included, against 5,449 each alone in an `.ori`: 13% more. They have few values in
+common (the escapes are the coloured drawing's alone), and each draws with characters of its own.
+Shared alone, the index saved little either: 6,211 bytes in all, against 6,235 with an index each,
+when indexes were kept beside folded files.
+
+Genesis, a chapter a file (`examples/data/biblical_text_multiple`: 199,246 bytes in 50 files), with
+the text squeeze into base64url. The whole book is the chapters joined, 199,295 bytes, a blank line
+between chapters, as `tests/chapters.rs` builds it:
+
+| Genesis | Folded | Index | In all |
+|---|--:|--:|--:|
+| The whole book, one file | 117,526 | 3,435 (507 values) | 120,961 |
+| The whole book, in parts | | | 119,475 |
+| 50 chapters, each with its own index | 162,501 | 3,362 (50 indexes) | 165,863 |
+| 50 chapters folded together, one index | 162,976 | 864 (117 values) | 163,840 |
+| 50 chapters in parts, each its own index | | 3,362 | 150,860 |
+| The whole book, one `.ori` | 119,318 | (inside) | 119,318 |
+| 50 chapters, each an `.ori` of its own | 152,442 | (inside) | 152,442 |
+| 50 chapters folded together: `.ori` files, one `.orinv` | 120,183 | 3,872 (the `.orinv`) | 124,055 |
+
+Where the chapters' 42.9 KB more than the whole book go, with one shared index:
+
+| Folded files | Whole book | 50 chapters, one index | More |
+|---|--:|--:|--:|
+| Lines | 115,433 | 142,804 | 27,371 |
+| Code tables | 2,041 | 17,572 | 15,531 |
+| Headers | 52 | 2,600 | 2,548 |
+| Index | 3,435 | 864 | −2,571 |
+
+The index is not where they lose: shared, it is smaller than the book's. The lines are. Each
+chapter decides alone what is worth listing, and a word must pay for its place within that
+chapter, so a chapter lists a few words, the 50 of them 117 in all, where the whole book lists 507,
+and spells the rest a letter at a time. Then 50 code tables where the book has one, a line per
+symbol each (in parts, 94 B each), and 50 headers. Folded with the whole book's code and index
+instead (`--like`), the 50 chapters' lines take 115,433 bytes, exactly the book's: files folded
+together can be as small as the one file they make, if they share one code and one index, decided
+over all of them.
+
+Folded together so, into `.ori` files and an `.orinv`, they take 124,055 bytes: the book's lines,
+115,433; their unit once, 3,872 bytes of `.orinv`, of which the index's 507 words are 3,411; and 95
+bytes of header a file, 35 of them the `.orinv`'s name (`biblical_text_multiple.orinv`). That is
+the book's own `.ori`, 119,318 bytes, and the 50 headers.
+
+### Together where it pays
+
+Given together, files now fold together only where that takes less (`parts::fold_grouped`): each
+file is weighed against the others, what it would save the whole by leaving estimated from counts,
+and the folds decide between every file alone, all of them together, and each set the estimates
+propose. In bytes, as `.ori` files and an `.orinv`
+(`cargo run --release --example folded_together -- FILE…`):
+
+| Files given together | All together | Each alone | As folded | Weighing | Together alone |
+|---|--:|--:|--:|--:|--:|
+| Genesis's 50 chapters | 124,055 | 152,442 | 124,055, all sharing | 69 ms | 30 ms |
+| Three drawings | 6,158 | 5,449 | 5,449, each alone | 5 ms | |
+| Eight chapters and two drawings | 24,687 | 24,511 | 22,438, the chapters sharing | 19 ms | 7 ms |
+| 50 chapters, Kirino and the long drawing | 131,255 | 156,724 | 128,337, the chapters sharing | 116 ms | 41 ms |
+| `man bash`, licenses and orimoji's sources, 1.2 MB | 651,116 | 629,087 | 629,087, each alone | 634 ms | 247 ms |
+
+The estimate against folding: what the set takes, less what the rest take together and the file
+alone, as folded, for each file (parts only, no headers):
+
+| A file, among | Estimated | Folded |
+|---|--:|--:|
+| The long drawing, among the three | 492 | 475 |
+| Kirino, among the three | 218 | 212 |
+| Miku, among the three | 380 | 414 |
+| The long drawing, among eight chapters and Miku | 1,506 | 1,505 |
+| Miku, among eight chapters and the long drawing | 604 | 633 |
+| Chapter 1, among the same | −438 | −459 |
+| Kirino, among the 50 chapters | 443 | 501 |
+| Chapter 24, among the 50 and Kirino | −1,426 | −1,541 |
+
+It says which way every one of them goes, and within a tenth or so of how much: the file's own
+lines, shared and alone, and its unit alone are measured; only what it does to the others' code,
+and what it adds to the shared unit, are estimated, from the set's counts less its own.
+
+Few files share little. Genesis's first chapters, given together, against each alone, the
+`.orinv`'s name a single letter:
+
+| Chapters | Without an index | With one |
+|---|--:|--:|
+| 2 | 5,840 alone (5,840) | 5,177 together (5,381) |
+| 3 | 8,646 alone (8,646) | 7,490 together (7,990) |
+| 4 | 11,315 together (11,330) | 9,809 together (10,573) |
+
+Without an index, sharing saves a code table of 100 bytes or so a file, and costs each file a header
+naming the `.orinv`; with one, it also saves listing the same words in every file.
+
+## The text squeeze: a folded file against an `.ori`
+
+The text squeeze now folds into an `.ori` wherever it keeps its index inside, as `auto` does where
+it chooses it. Against the smallest folded file of the text squeeze, indexed, unindexed or measured,
+the `.ori` was smaller on every one of 20 inputs in each of three alphabets (base64url, two-byte and
+cjk). In base64url, by 0.6% on the whole book, 1.1% on `man bash`, 0.2% on two megabytes of a system
+log, 4% on a `Cargo.lock`, 6% on the long drawing, 12% on Miku, 37% on Kirino, and 15% to 40% on
+texts of a line or so, where the folded file's tables cost most (8% to 35% in the wider alphabets).
+Its margin is least where the index is largest: a folded file deflates its index with its tables,
+where an `.ori` keeps its words as they are. So no fold makes both to keep the smaller, which would
+take half as long again.
 
 ## The alphabets against base64
 

@@ -1,12 +1,15 @@
 //! What each squeeze and alphabet makes of an input: characters, bytes, screen width, and the bytes
-//! git would store for it, since git keeps every object zlib-compressed. An indexed fold is
-//! measured with its index, which the caller has to keep too. `orimoji measure` prints
-//! it; the tables in docs/observations.md were made the same way.
+//! git would store for it, since git keeps every object zlib-compressed. Each fold is measured as
+//! orimoji writes it: the text squeeze's as an `.ori`, its unit inside; any other's as a folded
+//! file, its index inside. `orimoji measure` prints it; the tables in docs/observations.md were
+//! made the same way, though the older of them with the index kept beside the folded text, and
+//! the text squeeze's as a folded file.
 
 use crate::alphabet::Alphabet;
 use crate::deadline::Deadline;
 use crate::index::Index;
 use crate::squeeze::{self, Squeeze, TableOptions};
+use crate::{ori, parts};
 use std::collections::BTreeSet;
 
 /// One fold of the input, measured.
@@ -64,6 +67,17 @@ pub fn measure(input: &[u8], alphabets: &[Alphabet]) -> Vec<Measurement> {
     for squeeze in squeezes(input) {
         let indexing: &[bool] = if squeeze.has_tables() { &[false, true] } else { &[false] };
         for &index in indexing {
+            if squeeze == Squeeze::Text {
+                // An .ori, as the text squeeze writes one; allowed to index, it weighs both ways.
+                let Ok(text) = std::str::from_utf8(input) else { continue };
+                for &alphabet in alphabets {
+                    let folded = parts::fold(text, alphabet, index);
+                    let file = ori::whole(&folded.lines, &folded.unit, alphabet);
+                    let squeeze = Some(squeeze.clone());
+                    out.push(Measurement::of(file.as_bytes(), squeeze, index, Some(alphabet)));
+                }
+                continue;
+            }
             let Ok(squeezed) = squeeze::squeeze(input, &squeeze, None, index, Deadline::NONE)
             else {
                 continue;
@@ -72,10 +86,16 @@ pub fn measure(input: &[u8], alphabets: &[Alphabet]) -> Vec<Measurement> {
             let kept = (!values.is_empty())
                 .then(|| Index::new(values).expect("a set holds no value twice"));
             for &alphabet in alphabets {
-                // What the caller keeps: the folded text, and the index beside it.
-                let mut folded =
-                    squeeze::render(squeeze.name(), &squeezed, alphabet, 100, false, kept.as_ref());
-                folded.extend(kept.as_ref().map(Index::to_text));
+                // The folded file, its index inside it.
+                let folded = squeeze::render(
+                    squeeze.name(),
+                    &squeezed,
+                    alphabet,
+                    100,
+                    false,
+                    kept.as_ref(),
+                    true,
+                );
                 let squeeze = Some(squeeze.clone());
                 out.push(Measurement::of(folded.as_bytes(), squeeze, index, Some(alphabet)));
             }

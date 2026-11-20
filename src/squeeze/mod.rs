@@ -5,6 +5,7 @@
 //! everywhere with any edit. [`Squeeze::by_line`] says which.
 
 pub(crate) mod deflate;
+pub(crate) mod lengths;
 mod pack;
 mod plain;
 mod table;
@@ -18,6 +19,7 @@ use crate::bits::Bits;
 use crate::container::{self, Folded, Header, Line as FileLine};
 use crate::deadline::Deadline;
 use crate::error::{FoldError, UnfoldError};
+use crate::escape::{escape, unescape};
 use crate::index::Index;
 
 /// How data is made smaller before it is folded.
@@ -222,7 +224,8 @@ pub(crate) fn squeeze(
 }
 
 /// The folded file, with its tables deflated where that makes them smaller, unless `readable`.
-/// Values its tables put in an index are written as their places in `index`, which must hold them.
+/// Values its tables put in an index are written as their places in `index`, which must hold them;
+/// and with `inside`, the index goes into the tables too, so that the file unfolds alone.
 pub(crate) fn render(
     squeeze: &str,
     squeezed: &Squeezed,
@@ -230,12 +233,14 @@ pub(crate) fn render(
     wrap: usize,
     readable: bool,
     index: Option<&Index>,
+    inside: bool,
 ) -> String {
-    render_within(squeeze, squeezed, alphabet, wrap, readable, index, Deadline::NONE)
+    render_within(squeeze, squeezed, alphabet, wrap, readable, index, inside, Deadline::NONE)
         .expect("no deadline to pass")
 }
 
 /// [`render`], giving up past `deadline`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_within(
     squeeze: &str,
     squeezed: &Squeezed,
@@ -243,13 +248,23 @@ pub(crate) fn render_within(
     wrap: usize,
     readable: bool,
     index: Option<&Index>,
+    inside: bool,
     deadline: Deadline,
 ) -> Result<String, FoldError> {
     let index = index.filter(|_| !squeezed.tables.index_values().is_empty());
     let mut options = squeezed.options.clone();
     options.extend(index.map(|index| format!("index={}", index.mark())));
-    let header = Header { squeeze: squeeze.to_string(), alphabet, options };
-    let lines = squeezed.tables.lines(index);
+    // A file that keeps its index inside it is format 2; any other, format 1, as it always was.
+    let version = match (inside, index) {
+        (true, Some(_)) => 2,
+        _ => 1,
+    };
+    let header = Header { version, squeeze: squeeze.to_string(), alphabet, options };
+    let mut lines = squeezed.tables.lines(index);
+    if let (2, Some(index)) = (version, index) {
+        lines.push(container::INDEX.to_string());
+        lines.extend(index.values().iter().map(|value| index_line(value)));
+    }
     let tables = match readable || lines.is_empty() {
         true => lines,
         false => {
@@ -303,17 +318,40 @@ fn stream(bytes: &[u8], alphabet: Alphabet, wrap: usize) -> impl Iterator<Item =
     empty.into_iter().chain(bytes.chunks(piece).map(move |piece| alphabet.fold_bytes(piece)))
 }
 
-/// The index `folded` needs, from the one given: none if it needs none, and refused if it needs one
-/// and `given` isn't it.
-pub(crate) fn needed<'a>(
+/// A value of an index kept inside a folded file, as its line in the tables: escaped, and a first
+/// `=` written as its code point, so that no value reads as a section's line, `=== … ===`.
+fn index_line(value: &str) -> String {
+    let line = escape(value);
+    match line.strip_prefix('=') {
+        Some(rest) => format!("\\u{{3d}}{rest}"),
+        None => line,
+    }
+}
+
+/// The index `folded` needs: none if it needs none; the one inside it, in format 2; or the one
+/// given, refused if it needs one and `given` isn't it.
+pub(crate) fn needed(
     folded: &Folded<'_>,
-    given: Option<&'a Index>,
-) -> Result<Option<&'a Index>, UnfoldError> {
-    match (folded.header.value("index"), given) {
-        (None, _) => Ok(None),
-        (Some(_), None) => Err(UnfoldError::NeedsIndex),
-        (Some(mark), Some(index)) if index.fits(mark) => Ok(Some(index)),
-        (Some(_), Some(_)) => Err(UnfoldError::WrongIndex),
+    given: Option<&Index>,
+) -> Result<Option<Index>, UnfoldError> {
+    let Some(mark) = folded.header.value("index") else { return Ok(None) };
+    let sections = container::sections(&folded.tables);
+    let inside = sections.iter().find(|(name, _)| format!("=== {name} ===") == container::INDEX);
+    let index = match (inside, given) {
+        (Some((_, lines)), _) => {
+            let values: Vec<String> = lines
+                .iter()
+                .map(|line| unescape(line.text))
+                .collect::<Result<_, _>>()
+                .map_err(UnfoldError::Index)?;
+            Index::new(values)?
+        }
+        (None, Some(index)) => index.clone(),
+        (None, None) => return Err(UnfoldError::NeedsIndex),
+    };
+    match index.fits(mark) {
+        true => Ok(Some(index)),
+        false => Err(UnfoldError::WrongIndex),
     }
 }
 
@@ -322,6 +360,7 @@ pub(crate) fn unsqueeze(
     index: Option<&Index>,
 ) -> Result<Vec<u8>, UnfoldError> {
     let index = needed(folded, index)?;
+    let index = index.as_ref();
     match folded.header.squeeze.as_str() {
         "none" => plain::unsqueeze(folded),
         "pack" => pack::unsqueeze(folded),

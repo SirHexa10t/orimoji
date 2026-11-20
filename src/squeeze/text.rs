@@ -23,9 +23,11 @@
 //! - **Counts in a code chosen for them** (see [`CountCode`]): Elias gamma as everywhere else, or
 //!   with low bits written as they are, or with their lengths in a Huffman code of their own,
 //!   whichever writes this text's counts in the fewest bits.
-//! - **A compact table**: code lengths as five bits each, and characters as steps from the one
-//!   before, where a folded file writes a line per symbol.
+//! - **A compact table**: characters as steps from the one before, their low bits written as
+//!   they are where that is shorter, and code lengths five bits each or in a code of their own
+//!   (see [`super::lengths`]), where a folded file writes a line per symbol.
 
+use super::lengths::{Lengths, LengthsCode};
 use super::{Body, Kept, Line, Squeezed, Tables};
 use crate::bits::{BitReader, BitWriter};
 use crate::container::{self, Folded, Line as FileLine};
@@ -83,9 +85,28 @@ pub(crate) const MOST_LOW_BITS: u32 = 7;
 /// The most buckets a count code may have: enough for any count of [`LONGEST_RUN`] repeats.
 const MOST_BUCKETS: u64 = 13;
 
-/// How many bits a code length takes in a compact table: lengths run from 1 to
-/// [`huffman::MAX_LENGTH`].
+/// How many bits the code length of a count's bucket takes in a compact table: lengths run from 1
+/// to [`huffman::MAX_LENGTH`].
 const LENGTH_BITS: u32 = 5;
+
+/// The most low bits of a character's step a compact table writes as they are: past it, a step
+/// costs about what the character's whole code point does.
+pub(crate) const MOST_STEP_BITS: u32 = 15;
+
+/// How a compact table is written, beyond the code it holds: how its code lengths are written,
+/// and how many low bits of each character's step from the one before are written as they are.
+/// A fold into parts chooses both, and its choices record them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TableChoices {
+    pub(crate) lengths: LengthsCode,
+    pub(crate) step_bits: u32,
+}
+
+impl TableChoices {
+    /// How the first format of parts wrote every table: lengths in five bits, steps in Elias gamma.
+    pub(crate) const FIRST: TableChoices =
+        TableChoices { lengths: LengthsCode::Fixed, step_bits: 0 };
+}
 
 /// One step of spelling: a character or escape, or a run of the one before.
 enum Event<'a> {
@@ -345,43 +366,93 @@ impl TextCode {
             && self.counts.same_as(&other.counts)
     }
 
+    /// The same code, its counts written with `k` low bits as they are and, when `coded`, every
+    /// bucket a count of up to a run's longest can need in one code of equal lengths: a count code
+    /// no fold would choose, which writes every run all the same, for the tests to try them all.
+    #[cfg(test)]
+    pub(crate) fn with_counts(self, k: u32, coded: bool) -> Self {
+        let buckets = coded.then(|| {
+            let lengths = huffman::lengths(&[1; MOST_BUCKETS as usize]);
+            (Encoder::new(lengths.clone()).unwrap(), Decoder::new(&lengths).unwrap())
+        });
+        Self { counts: CountCode { k, buckets }, ..self }
+    }
+
     /// How its counts are written: `k`, and whether their buckets have a code of their own.
     pub(crate) fn count_choices(&self) -> (u32, bool) {
         (self.counts.k, self.counts.buckets.is_some())
     }
 
-    /// Its compact table: how many characters and how many longer texts it spells; the code
-    /// lengths of `<end>`, `<esc>` and `<run>`; each character as a step from the one before (the
-    /// first, from nothing) and its code length; each longer text as a step from the place in
-    /// `index` of the one before, and its code length; and, when its counts' buckets have a code
-    /// of their own, how many buckets there are and each one's code length. Numbers are in Elias
-    /// gamma, code lengths five bits each.
-    pub(crate) fn write_compact(&self, writer: &mut BitWriter, index: Option<&Index>) {
-        let texts = |many: bool| {
-            self.symbols[3..].iter().filter_map(move |symbol| match symbol {
-                Symbol::Text(text) if text.chars().nth(1).is_some() == many => Some(text),
+    /// How its compact table is written shortest: its lengths in whichever way writes them in the
+    /// fewest bits, and its characters' steps with the low bits that write them in the fewest.
+    pub(crate) fn table_choices(&self) -> TableChoices {
+        let steps = self.steps();
+        let step_bits = (0..=MOST_STEP_BITS)
+            .min_by_key(|&k| steps.iter().map(|&step| golomb_bits(step - 1, k)).sum::<u64>())
+            .expect("there are choices");
+        TableChoices { lengths: LengthsCode::cheapest(self.encoder.lengths()), step_bits }
+    }
+
+    /// Each character's step from the one before, the first's from nothing: its code point plus
+    /// one.
+    fn steps(&self) -> Vec<u64> {
+        let mut before = None;
+        self.characters()
+            .map(|c| {
+                let point = c as u64;
+                let step = before.map_or(point + 1, |before| point - before);
+                before = Some(point);
+                step
+            })
+            .collect()
+    }
+
+    /// The characters it spells, in its order, which is their code points'.
+    fn characters(&self) -> impl Iterator<Item = char> + '_ {
+        self.symbols[3..].iter().filter_map(|symbol| match symbol {
+            Symbol::Text(text) if text.chars().nth(1).is_none() => text.chars().next(),
+            _ => None,
+        })
+    }
+
+    /// Its compact table, written as `choices` say: how many characters and how many longer texts
+    /// it spells; what its way of writing code lengths describes first; the code lengths of
+    /// `<end>`, `<esc>` and `<run>`; each character as a step from the one before (the first, from
+    /// nothing), its low bits as they are, and its code length; each longer text as a step from the
+    /// place in `index` of the one before, and its code length; and, when its counts' buckets have
+    /// a code of their own, how many buckets there are and each one's code length. Numbers are in
+    /// Elias gamma, and a step in Exp-Golomb: Elias gamma for all but its `k` low bits.
+    pub(crate) fn write_compact(
+        &self,
+        writer: &mut BitWriter,
+        index: Option<&Index>,
+        choices: TableChoices,
+    ) {
+        let lengths = Lengths::writing(choices.lengths, self.encoder.lengths());
+        let longer: Vec<&String> = self.symbols[3..]
+            .iter()
+            .filter_map(|symbol| match symbol {
+                Symbol::Text(text) if text.chars().nth(1).is_some() => Some(text),
                 _ => None,
             })
-        };
-        let (characters, longer) = (texts(false).count(), texts(true).count());
-        writer.gamma(characters as u64 + 1);
-        writer.gamma(longer as u64 + 1);
+            .collect();
+        let steps = self.steps();
+        writer.gamma(steps.len() as u64 + 1);
+        writer.gamma(longer.len() as u64 + 1);
+        lengths.write_described(writer);
         for symbol in 0..3 {
-            writer.write(self.encoder.length(symbol) as u64, LENGTH_BITS);
+            lengths.write(writer, self.encoder.length(symbol));
+        }
+        for (c, step) in self.characters().zip(steps) {
+            write_golomb(writer, step - 1, choices.step_bits);
+            lengths.write(writer, self.encoder.length(self.index[c.to_string().as_str()]));
         }
         let mut before = None;
-        for text in texts(false) {
-            let point = text.chars().next().expect("a character") as u64;
-            writer.gamma(before.map_or(point + 1, |before| point - before));
-            writer.write(self.encoder.length(self.index[text.as_str()]) as u64, LENGTH_BITS);
-            before = Some(point);
-        }
-        let mut before = None;
-        for text in texts(true) {
+        for text in longer {
             let place = index.and_then(|index| index.place(text));
             let place = place.expect("a fold into parts indexes every longer text") as u64;
             writer.gamma(before.map_or(place + 1, |before| place - before));
-            writer.write(self.encoder.length(self.index[text.as_str()]) as u64, LENGTH_BITS);
+            lengths.write(writer, self.encoder.length(self.index[text.as_str()]));
             before = Some(place);
         }
         if let Some((encoder, _)) = &self.counts.buckets {
@@ -392,38 +463,34 @@ impl TextCode {
         }
     }
 
-    /// The code a [`TextCode::write_compact`] table holds, its counts written with `k` low bits
-    /// as they are and, when `coded`, their buckets in a code of their own. Refused, with what is
-    /// wrong, where the bits are no table a fold writes.
+    /// The code a [`TextCode::write_compact`] table holds, written as `choices` say, its counts
+    /// written with `k` low bits as they are and, when `coded`, their buckets in a code of their
+    /// own. Refused, with what is wrong, where the bits are no table a fold writes.
     pub(crate) fn read_compact(
         reader: &mut BitReader<'_>,
         index: Option<&Index>,
         k: u32,
         coded: bool,
+        choices: TableChoices,
     ) -> Result<Self, String> {
         let short = || "it is cut short".to_string();
-        // Each entry takes six bits at least, so a count the bits can't hold is refused before
-        // anything is made for it.
+        // Each entry takes two bits at least, a step and a length, so a count the bits can't hold
+        // is refused before anything is made for it.
         let how_many = |reader: &mut BitReader<'_>| {
             let many = reader.gamma().ok_or_else(short)? - 1;
-            match many <= reader.remaining() as u64 / 6 {
+            match many <= reader.remaining() as u64 / 2 {
                 true => Ok(many as usize),
                 false => Err(format!("it lists {many} entries, more than it has bits for")),
             }
         };
         let (characters, longer) = (how_many(reader)?, how_many(reader)?);
-        let length = |reader: &mut BitReader<'_>| {
-            let length = reader.read(LENGTH_BITS).ok_or_else(short)? as u32;
-            match (1..=huffman::MAX_LENGTH).contains(&length) {
-                true => Ok(length),
-                false => Err(format!("a code {length} bits long, which no code is")),
-            }
-        };
+        let written = Lengths::reading(choices.lengths, reader)?;
+        let length = |reader: &mut BitReader<'_>| written.read(reader);
         let mut symbols = vec![Symbol::End, Symbol::Esc, Symbol::Run];
         let mut lengths = vec![length(reader)?, length(reader)?, length(reader)?];
         let mut before = None;
         for _ in 0..characters {
-            let step = reader.gamma().ok_or_else(short)?;
+            let step = read_golomb(reader, choices.step_bits).ok_or_else(short)? + 1;
             let point = before.map_or(Some(step - 1), |before: u64| before.checked_add(step));
             let c = point.and_then(|point| u32::try_from(point).ok()).and_then(char::from_u32);
             let c = c.ok_or_else(|| "a character past the last there is".to_string())?;
@@ -452,8 +519,9 @@ impl TextCode {
                 if buckets > MOST_BUCKETS {
                     return Err(format!("{buckets} buckets of counts, more than any count needs"));
                 }
+                let fixed = Lengths::reading(LengthsCode::Fixed, reader)?;
                 let lengths: Vec<u32> =
-                    (0..buckets).map(|_| length(reader)).collect::<Result<_, _>>()?;
+                    (0..buckets).map(|_| fixed.read(reader)).collect::<Result<_, _>>()?;
                 let coded = Encoder::new(lengths.clone()).zip(Decoder::new(&lengths));
                 let coded =
                     coded.ok_or_else(|| "the counts' code is no prefix code".to_string())?;
@@ -627,6 +695,25 @@ fn gamma_bits(n: u64) -> u32 {
     2 * (63 - n.leading_zeros()) + 1
 }
 
+/// `value` in Exp-Golomb: all but its `k` low bits, plus one, in Elias gamma, then the low bits.
+/// With `k = 0`, Elias gamma of `value + 1`.
+fn write_golomb(writer: &mut BitWriter, value: u64, k: u32) {
+    writer.gamma((value >> k) + 1);
+    writer.write(value, k);
+}
+
+/// A value [`write_golomb`] wrote, or `None` where the bits run out or spell more than a `u64`.
+fn read_golomb(reader: &mut BitReader<'_>, k: u32) -> Option<u64> {
+    let high = reader.gamma()? - 1;
+    let low = reader.read(k)?;
+    high.checked_mul(1 << k)?.checked_add(low)
+}
+
+/// The bits [`write_golomb`] writes `value` in.
+fn golomb_bits(value: u64, k: u32) -> u64 {
+    gamma_bits((value >> k) + 1) as u64 + k as u64
+}
+
 /// The words and escapes in `strings` worth a symbol of their own, if asked to index at all.
 fn known_tokens<'a>(
     strings: impl Iterator<Item = &'a str>,
@@ -659,7 +746,7 @@ fn wordy(c: char) -> bool {
 /// Whether a word or escape seen `count` times saves, as one symbol, at least twice the space its
 /// table line takes. A character is guessed at 5 bits, the symbol's own code at 12, and a bit of
 /// the body at a sixth of a byte, as in base64.
-fn worth_a_symbol(token: &str, count: u64) -> bool {
+pub(crate) fn worth_a_symbol(token: &str, count: u64) -> bool {
     let saved = count as f64 * (token.chars().count() as f64 * 5.0 - 12.0) / 6.0;
     saved >= 2.0 * (escape(token).len() as f64 + 4.0)
 }
@@ -708,6 +795,39 @@ fn units(text: &str, known: impl Fn(&str) -> bool) -> Vec<&str> {
         at += len;
     }
     units
+}
+
+/// What a text holds, as a code spelling the words and escapes in `known` as one symbol each would
+/// spell it: how often each unit comes, and how many runs and lines it has, every three alike or
+/// more counted as a run. Several texts folded together tally each, so that what one brings to
+/// their code is told by taking its tally from all of theirs.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Tally<'a> {
+    pub(crate) units: HashMap<&'a str, u64>,
+    pub(crate) runs: u64,
+    pub(crate) ends: u64,
+}
+
+impl<'a> Tally<'a> {
+    /// The tally of `text`'s lines, the empty ones left out, as the code is learnt.
+    pub(crate) fn of(text: &'a str, known: &HashSet<&str>) -> Self {
+        let mut tally = Self::default();
+        for line in text.split('\n').filter(|line| !line.is_empty()) {
+            for event in events(&units(line, |token| known.contains(token))) {
+                match event {
+                    Event::Unit(unit) => *tally.units.entry(unit).or_default() += 1,
+                    Event::Run(_) => tally.runs += 1,
+                }
+            }
+            tally.ends += 1;
+        }
+        tally
+    }
+
+    /// How many symbols it spells: its units, its runs, and an `<end>` a line.
+    pub(crate) fn symbols(&self) -> u64 {
+        self.units.values().sum::<u64>() + self.runs + self.ends
+    }
 }
 
 /// Units, with three or more alike in a row written as the first and a run of the rest.
@@ -960,14 +1080,22 @@ mod tests {
             let values = code.symbols();
             let kept = (!values.is_empty()).then(|| Index::new(values).unwrap());
             assert_eq!(kept.is_some(), index, "the escape and the word are worth indexing");
-            let mut writer = BitWriter::new();
-            code.write_compact(&mut writer, kept.as_ref());
-            let bits = writer.finish();
             let (k, coded) = code.count_choices();
-            let read = TextCode::read_compact(&mut bits.reader(), kept.as_ref(), k, coded).unwrap();
-            assert!(read.same_code_as(&code));
-            for text in &strings {
-                assert_eq!(spelled(&read, text), spelled(&code, text));
+            let ways = LengthsCode::ALL.into_iter().flat_map(|lengths| {
+                [0, 3, MOST_STEP_BITS].map(|step_bits| TableChoices { lengths, step_bits })
+            });
+            for choices in ways.chain([code.table_choices()]) {
+                let mut writer = BitWriter::new();
+                code.write_compact(&mut writer, kept.as_ref(), choices);
+                let bits = writer.finish();
+                let mut reader = bits.reader();
+                let read =
+                    TextCode::read_compact(&mut reader, kept.as_ref(), k, coded, choices).unwrap();
+                assert_eq!(reader.position(), bits.len(), "{choices:?}: read to its end");
+                assert!(read.same_code_as(&code), "{choices:?}");
+                for text in &strings {
+                    assert_eq!(spelled(&read, text), spelled(&code, text));
+                }
             }
         }
     }
@@ -1037,7 +1165,9 @@ mod tests {
             ),
         ];
         for (bits, says) in cases {
-            let refused = TextCode::read_compact(&mut bits.reader(), None, 0, false).err();
+            let refused =
+                TextCode::read_compact(&mut bits.reader(), None, 0, false, TableChoices::FIRST)
+                    .err();
             assert!(
                 refused.as_deref().is_some_and(|why| why.contains(says)),
                 "{says}: {refused:?}"

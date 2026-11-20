@@ -19,8 +19,14 @@
 use crate::alphabet::Alphabet;
 use crate::error::UnfoldError;
 
-/// The format this orimoji writes, and the newest it reads.
-pub(crate) const VERSION: u32 = 1;
+/// The newest format this orimoji reads. A file is written in the oldest that holds it: 1 for one
+/// that needs nothing outside itself, or only an index kept beside it; 2 for one that keeps its
+/// index inside it; 3 for an `.ori` or an `.orinv`, which keep a unit with lines (see
+/// [`crate::ori`]).
+pub(crate) const VERSION: u32 = 3;
+
+/// The section of a format 2 file's tables that holds the index it was folded with.
+pub(crate) const INDEX: &str = "=== index ===";
 
 const BODY: &str = "=== body ===";
 
@@ -30,15 +36,17 @@ pub(crate) const DEFLATED: &str = "=== deflated tables ===";
 /// What the header line says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Header {
+    /// The format it is in.
+    pub(crate) version: u32,
     pub(crate) squeeze: String,
     pub(crate) alphabet: Alphabet,
     pub(crate) options: Vec<String>,
 }
 
 impl Header {
-    fn line(&self) -> String {
+    pub(crate) fn line(&self) -> String {
         let options: String = self.options.iter().map(|option| format!(" {option}")).collect();
-        format!("=== orimoji {VERSION} {} {}{options} ===", self.squeeze, self.alphabet)
+        format!("=== orimoji {} {} {}{options} ===", self.version, self.squeeze, self.alphabet)
     }
 
     /// Whether the option `name` is given, alone or as `name=…`.
@@ -142,6 +150,7 @@ fn header(line: &str) -> Result<Header, UnfoldError> {
         UnfoldError::Header(format!("`{alphabet}` is no alphabet this orimoji knows"))
     })?;
     Ok(Header {
+        version,
         squeeze: squeeze.to_string(),
         alphabet,
         options: words.map(str::to_string).collect(),
@@ -194,6 +203,7 @@ mod tests {
     #[test]
     fn a_file_reads_back_into_the_parts_it_was_made_of() {
         let header = Header {
+            version: 1,
             squeeze: "deflate".into(),
             alphabet: Alphabet::Cjk,
             options: vec!["lean=2".into()],

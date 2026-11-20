@@ -92,11 +92,18 @@ pub enum UnfoldError {
     Choices(String),
     /// The code table of a fold into parts doesn't read.
     CodeTable(String),
+    /// A fold's unit doesn't read, or holds what no fold puts in one.
+    Unit(String),
     /// The table, the choices or the index aren't the ones a fold into parts made its lines with:
     /// one is damaged, or comes from another fold.
     PartsDontFit,
     /// A line would make the text more than the limit it was unfolded with.
     TooLarge { line: usize, limit: usize },
+    /// Its lines were folded together with other files', and unfold only with the unit they
+    /// share, in this `.orinv`, which is missing: not given, or not where the file names it.
+    NeedsOrinv(String),
+    /// The `.orinv`, given or found, holds another unit than the one its lines were folded with.
+    WrongOrinv,
 }
 
 impl fmt::Display for UnfoldError {
@@ -125,6 +132,7 @@ impl fmt::Display for UnfoldError {
             UnfoldError::Index(why) => write!(f, "the index: {why}"),
             UnfoldError::Choices(why) => write!(f, "the choices: {why}"),
             UnfoldError::CodeTable(why) => write!(f, "the code table: {why}"),
+            UnfoldError::Unit(why) => write!(f, "the unit: {why}"),
             UnfoldError::PartsDontFit => write!(
                 f,
                 "the table, the choices and the index aren't the ones the lines were folded with: \
@@ -132,6 +140,14 @@ impl fmt::Display for UnfoldError {
             ),
             UnfoldError::TooLarge { line, limit } => {
                 write!(f, "line {line}: it would unfold to more than {limit} bytes")
+            }
+            UnfoldError::NeedsOrinv(orinv) => write!(
+                f,
+                "its lines were folded together with other files', and unfold only with the unit \
+                 they share, in {orinv}, which is missing"
+            ),
+            UnfoldError::WrongOrinv => {
+                write!(f, "the .orinv holds another unit than the one its lines were folded with")
             }
         }
     }

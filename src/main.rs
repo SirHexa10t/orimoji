@@ -4,6 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use orimoji::files::{self, Output};
 use orimoji::measure::{self, Measurement};
 use orimoji::{Alphabet, Fold, Index, Indexing, Judged, Squeeze, TableOptions, UnfoldError};
+use std::error::Error;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -19,11 +20,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Fold standard input onto standard output, or files beside themselves (`FILE.folded`) or,
-    /// with --in-place, over themselves.
+    /// Fold standard input onto standard output, or files beside themselves (`FILE.ori` for the
+    /// text squeeze, `FILE.folded` for any other) or, with --in-place, over themselves. Text files
+    /// given together fold together where that takes less, sharing one unit in an `.orinv`; each
+    /// that takes less alone folds alone, its unit inside its `.ori`.
     Fold(FoldArgs),
     /// Unfold standard input onto standard output, or folded files beside themselves (taking
-    /// `.folded` off) or, with --in-place, over themselves.
+    /// `.ori` or `.folded` off) or, with --in-place, over themselves.
     Unfold(UnfoldArgs),
     /// Fold a file every way and compare: characters, bytes, screen width, and what git stores.
     Measure {
@@ -48,16 +51,18 @@ struct Files {
     /// Write over the files themselves, not beside them.
     #[arg(long)]
     in_place: bool,
-    /// The suffix of the files written beside them: a fold adds it, an unfold takes it off.
-    #[arg(long, default_value = files::SUFFIX)]
-    suffix: String,
+    /// The suffix of the files written beside them: a fold adds it, an unfold takes it off. By
+    /// default `.ori` for the text squeeze and `.folded` for any other.
+    #[arg(long, conflicts_with = "in_place")]
+    suffix: Option<String>,
 }
 
 impl Files {
     fn output(&self) -> Output {
-        match self.in_place {
-            true => Output::InPlace,
-            false => Output::Suffix(self.suffix.clone()),
+        match (self.in_place, &self.suffix) {
+            (true, _) => Output::InPlace,
+            (false, Some(suffix)) => Output::Suffix(suffix.clone()),
+            (false, None) => Output::Beside,
         }
     }
 
@@ -87,19 +92,28 @@ struct FoldArgs {
     /// The alphabet to fold into; see `orimoji alphabets`.
     #[arg(short, long, default_value = "base64url")]
     alphabet: String,
-    /// Index, and keep the index in FILE: written only if a list paid for itself. Files folded
-    /// together share it. With --like, the earlier fold's index, which is kept as it is.
-    #[arg(long, value_name = "FILE")]
-    index: Option<PathBuf>,
+    /// Index: write common words and escapes (text), or a column's common values (table), as
+    /// their places in a list, where a list pays for itself. The index is kept with the code:
+    /// inside the folded file, or in the .orinv of files folded together.
+    #[arg(long)]
+    index: bool,
     /// With --index: measure, not estimate, whether the index pays, by folding without it too and
     /// keeping the smaller fold, as it is; but spend TIME at most on it (30ms, 5s, 15m, 1h, 2d),
     /// and past it let the estimates decide. A fold waiting to be weighed is buffered in a
     /// temporary file once it is past 8 MiB: beside the output, or in TMPDIR for standard output.
+    /// (The text squeeze always weighs both.)
     #[arg(long, value_name = "TIME", requires = "index")]
     measure_up_to: Option<String>,
-    /// Keep the tables of this earlier fold, so lines that didn't change fold the same.
+    /// Keep the tables of this earlier fold, so lines that didn't change fold the same. For the
+    /// text squeeze, an .ori or an .orinv, whose unit the files are folded with: one naming an
+    /// .orinv, or the .orinv itself, and the files join those that share it.
     #[arg(long, value_name = "FOLDED")]
     like: Option<PathBuf>,
+    /// Where the .orinv of text files folded together goes (by the text squeeze, or by auto where
+    /// it chooses it): by default beside the first of those that share it, named after its
+    /// folder.
+    #[arg(long, value_name = "DIR")]
+    orinv_dir: Option<PathBuf>,
     /// Squeeze the whole file as one stream (none, deflate; zstd always does): smaller, but any
     /// edit changes the folded file from there on.
     #[arg(long)]
@@ -131,9 +145,13 @@ struct FoldArgs {
 struct UnfoldArgs {
     #[command(flatten)]
     files: Files,
-    /// The index the input was folded with, if it needs one.
+    /// The index a folded file was folded with, when it keeps it beside it (format 1).
     #[arg(long, value_name = "FILE")]
     index: Option<PathBuf>,
+    /// The .orinv holding the unit of .ori files folded together, when it isn't where they name
+    /// it.
+    #[arg(long, value_name = "FILE")]
+    orinv: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -146,7 +164,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Fold(args) => fold(args),
         Command::Unfold(args) => unfold(args),
@@ -162,16 +180,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn fold(args: FoldArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn fold(args: FoldArgs) -> Result<(), Box<dyn Error>> {
     let one_stream = args.files.one_stream()?;
     let alphabet = Alphabet::from_name(&args.alphabet)
         .ok_or_else(|| format!("`{}` is no alphabet", args.alphabet))?;
     let previous = args.like.as_ref().map(read_text).transpose()?;
-    if previous.is_some() && args.files.files.len() > 1 {
-        return Err("--like keeps the tables of one fold, for one input".into());
-    }
     let name = match (args.squeeze.as_str(), &previous) {
         // Keeping tables means keeping the squeeze they belong to.
+        ("auto", Some(previous)) if orimoji::ori::is_ori(previous) => "text".to_string(),
         ("auto", Some(previous)) => orimoji::folded_with(previous)?.0,
         (name, _) => name.to_string(),
     };
@@ -188,7 +204,6 @@ fn fold(args: FoldArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
         keep: (!args.keep.is_empty()).then(|| args.keep.clone()),
     };
-    let asked = args.index.is_some() && previous.is_none();
     let squeeze = match name.as_str() {
         "auto" => Squeeze::Auto(table),
         "none" => Squeeze::None { whole: args.whole },
@@ -204,15 +219,22 @@ fn fold(args: FoldArgs) -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     };
+    let shares = matches!(squeeze, Squeeze::Text | Squeeze::Auto(_));
+    if args.orinv_dir.is_some() && (!shares || one_stream) {
+        return Err("--orinv-dir places the .orinv of text files folded together, by the text \
+                    squeeze or auto"
+            .into());
+    }
     let measure_up_to = args.measure_up_to.as_deref().map(orimoji::time_limit).transpose()?;
     // A stream folded into a file is buffered beside it, on its disk; files, beside themselves.
     let output = args.files.output.as_ref().filter(|path| path.as_os_str() != "-");
     let how = Fold {
         wrap: args.wrap,
         readable: args.readable,
-        index: asked,
+        index: args.index,
         measure_up_to,
         buffer_folder: output.map(|path| folder_of(path).to_path_buf()),
+        orinv_dir: args.orinv_dir.clone(),
         ..Fold::new(squeeze, alphabet)
     };
     let said = |input: usize, folded: usize, squeeze: &Squeeze, written: &str| {
@@ -225,59 +247,114 @@ fn fold(args: FoldArgs) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     };
-    if let Some(previous) = &previous {
-        let index = match orimoji::needs_index(previous)? {
-            true => Some(read_index(
-                args.index.as_ref().ok_or("the earlier fold needs its index: --index FILE")?,
-            )?),
-            false => None,
-        };
-        let input = read(args.files.files.first())?;
-        let text = orimoji::fold_keeping(&input, previous, index.as_ref(), &how)?;
-        let target = match one_stream {
-            true => args.files.output.clone(),
-            false => Some(written_beside(&args.files.files[0], &args.files.output())),
-        };
-        write(target.as_ref(), text.as_bytes())?;
-        said(input.len(), text.len(), &how.squeeze, "");
-        return Ok(());
-    }
-    let (indexing, judged) = match one_stream {
+    // What became of the index, how it was decided, and, of several files, how many hold their own
+    // unit or index rather than share one, and how many there are.
+    let (indexing, judged, own, count) = match one_stream {
         true => {
+            let path = args.files.files.first().cloned().unwrap_or_else(|| PathBuf::from("-"));
             let input = read(args.files.files.first())?;
-            let folded = orimoji::fold(&input, &how)?;
+            let into = output.map_or_else(|| PathBuf::from("."), |path| folder_of(path).into());
+            let like = args.like.as_deref();
+            let folded = files::fold_stream(&input, &path, &how, like, &into).map_err(hint)?;
             write(args.files.output.as_ref(), folded.text.as_bytes())?;
             said(input.len(), folded.text.len(), &folded.squeeze, "");
-            (folded.indexing, folded.judged)
+            (folded.indexing, folded.judged, 0, 1)
         }
         false => {
             // The files are read by the fold itself; here, only their sizes, before any is
             // written over.
             let size_of = |path: &PathBuf| std::fs::metadata(path).map_or(0, |m| m.len() as usize);
             let input: usize = args.files.files.iter().map(size_of).sum();
-            let folded = files::fold_files(&args.files.files, &how, &args.files.output())?;
-            let size: usize = folded.written.iter().map(size_of).sum();
-            let files = folded.written.len();
-            said(
-                input,
-                size,
-                &folded.squeeze,
-                &format!(", {files} file{} written", if files == 1 { "" } else { "s" }),
-            );
-            (folded.indexing, folded.judged)
+            let (paths, place) = (&args.files.files, args.files.output());
+            let folded = match &args.like {
+                Some(like) => files::fold_files_like(paths, like, &how, &place),
+                None => files::fold_files(paths, &how, &place),
+            }
+            .map_err(hint)?;
+            let unit = folded.orinv.as_ref().map_or(0, size_of);
+            let size = folded.written.iter().map(size_of).sum::<usize>() + unit;
+            let count = folded.written.len();
+            let shared = match (&folded.orinv, folded.sharing.len()) {
+                (Some(orinv), sharing) if sharing == count => {
+                    format!(", their unit in {}", orinv.display())
+                }
+                (Some(orinv), sharing) => format!(
+                    ", {sharing} of them sharing their unit in {}, the rest each with its own: \
+                     they take less alone",
+                    orinv.display()
+                ),
+                (None, _) if count > 1 && folded.squeeze == Squeeze::Text => {
+                    ", each with its own unit: folded together, they would take more".to_string()
+                }
+                (None, _) => String::new(),
+            };
+            let written =
+                format!(", {count} file{} written{shared}", if count == 1 { "" } else { "s" });
+            said(input, size, &folded.squeeze, &written);
+            let own = if count > 1 { count - folded.sharing.len() } else { 0 };
+            (folded.indexing, folded.judged, own, count)
         }
     };
     if !args.quiet {
         tell_judged(judged, args.measure_up_to.as_deref());
+        // Files each with its own unit keep each its own index; files sharing one share its.
+        let rest = match own {
+            0 => "",
+            _ => "; those folded alone keep their own, where a list paid for itself",
+        };
+        match (indexing, own) {
+            (Indexing::Off, _) => {}
+            (_, own) if own > 0 && own == count => eprintln!(
+                "orimoji: each file keeps its own index with its code, where a list paid for itself"
+            ),
+            (Indexing::Index(index), _) => {
+                let values = match index.len() {
+                    1 => "1 value".to_string(),
+                    count => format!("{count} values"),
+                };
+                eprintln!("orimoji: the index, {values}, is kept with the code{rest}");
+            }
+            (Indexing::Unneeded, _) => {
+                eprintln!("orimoji: no list paid for itself, so there is no index{rest}")
+            }
+        }
     }
-    keep_index(&indexing, args.index.as_deref(), args.quiet)?;
     Ok(())
+}
+
+/// What a fold or an unfold refused, with what to give it, where it needs more.
+fn hint(error: files::FilesError) -> Box<dyn Error> {
+    match error {
+        files::FilesError::Unfold { path, error: UnfoldError::NeedsIndex } => {
+            format!("{}: {}: give it with --index FILE", path.display(), UnfoldError::NeedsIndex)
+                .into()
+        }
+        files::FilesError::Unfold { path, error: error @ UnfoldError::NeedsOrinv(_) } => {
+            format!("{}: {error}: give it with --orinv FILE", path.display()).into()
+        }
+        files::FilesError::Unfold { path, error: UnfoldError::WrongOrinv } => format!(
+            "{}: {}: give the one it was folded with, with --orinv FILE",
+            path.display(),
+            UnfoldError::WrongOrinv
+        )
+        .into(),
+        files::FilesError::Fold {
+            path,
+            error: orimoji::FoldError::Previous(UnfoldError::NeedsIndex),
+        } => format!(
+            "{}: the earlier fold keeps its index beside it (format 1): unfold it with --index \
+             FILE, and fold it afresh",
+            path.display()
+        )
+        .into(),
+        error => error.into(),
+    }
 }
 
 /// Says how a measured fold decided its index.
 fn tell_judged(judged: Judged, limit: Option<&str>) {
     match judged {
-        Judged::Estimated => {}
+        Judged::Estimated | Judged::Weighed => {}
         Judged::Measured { indexed, unindexed } => eprintln!(
             "orimoji: measured {indexed} bytes indexed, index included, against {unindexed} without: {}",
             if unindexed <= indexed {
@@ -293,52 +370,23 @@ fn tell_judged(judged: Judged, limit: Option<&str>) {
     }
 }
 
-/// Writes the index a fold made where the caller asked, or says why there is none.
-fn keep_index(indexing: &Indexing, path: Option<&Path>, quiet: bool) -> std::io::Result<()> {
-    match (indexing, path) {
-        (Indexing::Index(index), Some(path)) => {
-            std::fs::write(path, index.to_text())?;
-            if !quiet {
-                eprintln!("orimoji: the index, {} values, is in {}", index.len(), path.display());
-            }
-        }
-        (Indexing::Unneeded, Some(path)) if !quiet => eprintln!(
-            "orimoji: no list paid for itself, so there is no index: {} wasn't written, and the folded text unfolds without one",
-            path.display()
-        ),
-        _ => {}
-    }
-    Ok(())
-}
-
-fn unfold(args: UnfoldArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn unfold(args: UnfoldArgs) -> Result<(), Box<dyn Error>> {
     let one_stream = args.files.one_stream()?;
     let index = args.index.as_ref().map(read_index).transpose()?;
-    let hint = |error: UnfoldError| -> Box<dyn std::error::Error> {
-        match error {
-            UnfoldError::NeedsIndex => format!("{error}: give it with --index FILE").into(),
-            error => error.into(),
-        }
-    };
+    let orinv = args.orinv.as_deref();
     if one_stream {
-        let path = args.files.files.first();
-        let text = read_text(path.cloned().unwrap_or_else(|| PathBuf::from("-")))?;
-        let unfolded = orimoji::unfold(&text, index.as_ref()).map_err(hint)?;
+        let path = args.files.files.first().cloned().unwrap_or_else(|| PathBuf::from("-"));
+        let text = read_text(&path)?;
+        let from = match args.files.files.first() {
+            Some(path) if path.as_os_str() != "-" => folder_of(path).to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let unfolded =
+            files::unfold_stream(&text, &path, index.as_ref(), orinv, &from).map_err(hint)?;
         return Ok(write(args.files.output.as_ref(), &unfolded)?);
     }
-    files::unfold_files(&args.files.files, index.as_ref(), &args.files.output()).map_err(
-        |error| -> Box<dyn std::error::Error> {
-            match error {
-                files::FilesError::Unfold { path, error: UnfoldError::NeedsIndex } => format!(
-                    "{}: {}: give it with --index FILE",
-                    path.display(),
-                    UnfoldError::NeedsIndex
-                )
-                .into(),
-                error => error.into(),
-            }
-        },
-    )?;
+    files::unfold_files(&args.files.files, index.as_ref(), orinv, &args.files.output())
+        .map_err(hint)?;
     Ok(())
 }
 
@@ -350,28 +398,14 @@ fn folder_of(path: &Path) -> &Path {
     }
 }
 
-/// Where a fold of `path` is written, as `output` says.
-fn written_beside(path: &Path, output: &Output) -> PathBuf {
-    match output {
-        Output::InPlace => path.to_path_buf(),
-        Output::Suffix(suffix) => {
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            path.with_file_name(format!("{name}{suffix}"))
-        }
-    }
-}
-
-fn read_text(path: impl AsRef<Path>) -> Result<String, Box<dyn std::error::Error>> {
+fn read_text(path: impl AsRef<Path>) -> Result<String, Box<dyn Error>> {
     let path = path.as_ref();
     let bytes = read(Some(&path.to_path_buf()))?;
     String::from_utf8(bytes)
         .map_err(|_| format!("{}: a folded file is UTF-8, and this isn't", path.display()).into())
 }
 
-fn read_index(path: impl AsRef<Path>) -> Result<Index, Box<dyn std::error::Error>> {
+fn read_index(path: impl AsRef<Path>) -> Result<Index, Box<dyn Error>> {
     let path = path.as_ref();
     let text =
         std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
